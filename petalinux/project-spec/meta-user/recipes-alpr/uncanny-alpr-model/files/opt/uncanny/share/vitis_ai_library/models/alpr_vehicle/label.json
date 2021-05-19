@@ -1,0 +1,52 @@
+
+{
+  "model-name": "alpr_vehicle",
+  "num-labels": 9,
+  "labels" :[
+    {
+      "name": "motorcycle",
+      "label": 0,
+      "display_name" : "motorcycle"
+    },
+    {
+      "name": "auto",
+      "label": 1,
+      "display_name" : "auto"
+    },
+    {
+      "name": "car",
+      "label": 2,
+      "display_name" : "car" 
+    },
+    {
+      "name": "jeep",
+      "label": 3,
+      "display_name" : "jeep"
+    },
+    {
+      "name": "mini-truck",
+      "label": 4,
+      "display_name" : "mini-truck" 
+    },
+    {
+      "name": "tempo-traveller",
+      "label": 5,
+      "display_name" : "tempo-traveller"
+    },
+    {
+      "name": "bus",
+      "label": 6,
+      "display_name" : "bus"
+    },
+    {
+      "name": "truck",
+      "label": 7,
+      "display_name" : "truck" 
+    },
+    {
+      "name": "Number-plate",
+      "label": 8,
+      "display_name" : "Number-plate" 
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+prefix=/opt/uncanny
+exec_prefix=${prefix}
+libdir=${prefix}/lib
+includedir=${prefix}/include
+
+Name: TVM Runtime Library
+Description: TVM Runtime Library Implementation
+Requires: 
+Version: 1.0
+Libs: -L${libdir} -ltvm_runtime
+Cflags: -I${includedir}
+

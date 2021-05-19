@@ -1,0 +1,37 @@
+From 0f41e477727e2309c86d856930c51036b462a766 Mon Sep 17 00:00:00 2001
+From: pankajd <pankajd@xilinx.com>
+Date: Wed, 5 May 2021 03:46:39 -0600
+Subject: [PATCH] Update build dependencies for ivas-accel-sw-libs
+
+Signed-off-by: pankajd <pankajd@xilinx.com>
+---
+ meson.build | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/meson.build b/meson.build
+index 675c4b5..ca43e56 100644
+--- a/meson.build
++++ b/meson.build
+@@ -111,8 +111,8 @@ xrt_dep = dependency('xrt', version : xrt_req, required : true)
+ ivasutils_dep = cc.find_library('ivasutil', dirs : ['/usr/local/lib/','/usr/lib/'])
+ 
+ #gstivasmeta dependency
+-gstivasinfermeta_dep = cc.find_library('libgstivasinfermeta-'+api_version, dirs : ['/usr/local/lib/'])
+-ivasinputmeta_dep = cc.find_library('libgstivasinpinfermeta-' + api_version, dirs : ['/usr/local/lib/'])
++gstivasinfermeta_dep = dependency('ivas-gst-plugins', version : '>= 1.0', required: true)
++ivasinputmeta_dep = dependency('ivas-gst-plugins', version : '>= 1.0', required: true)
+ 
+ 
+ # External dependency
+@@ -122,7 +122,7 @@ opencv_dep = dependency('opencv', version : '>=3.4.0', required: true)
+ 
+ glog_dep = cc.find_library('glog', dirs : ['/usr/lib/x86_64-linux-gnu/'])
+ 
+-ivas_videolib_install_path = ['/usr/lib/ivas/']
++ivas_videolib_install_path = join_paths(get_option('libdir'), 'ivas')
+ 
+ plugins_pkgconfig_install_dir = join_paths(plugins_install_dir, 'pkgconfig')
+ if get_option('default_library') == 'shared'
+-- 
+2.7.4
+

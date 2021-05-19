@@ -1,0 +1,25 @@
+From 07f001c34283df2ecb31e2847cc0f9973944a15e Mon Sep 17 00:00:00 2001
+From: pankajd <pankajd@xilinx.com>
+Date: Thu, 11 Mar 2021 01:39:24 -0700
+Subject: [PATCH 2/2] Add ALPR to ivas model class
+
+Signed-off-by: pankajd <pankajd@xilinx.com>
+---
+ gst-libs/gst/ivas/gstivasinpinfer.h | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/gst-libs/gst/ivas/gstivasinpinfer.h b/gst-libs/gst/ivas/gstivasinpinfer.h
+index 76ed889..70f9b89 100644
+--- a/gst-libs/gst/ivas/gstivasinpinfer.h
++++ b/gst-libs/gst/ivas/gstivasinpinfer.h
+@@ -33,6 +33,7 @@ typedef enum
+   IVAS_XCLASS_REFINEDET,
+   IVAS_XCLASS_TFSSD,
+   IVAS_XCLASS_YOLOV2,
++  IVAS_XCLASS_ALPR_VEHICLE,
+ 
+   IVAS_XCLASS_NOTFOUND
+ }IvasClass;
+-- 
+2.7.4
+

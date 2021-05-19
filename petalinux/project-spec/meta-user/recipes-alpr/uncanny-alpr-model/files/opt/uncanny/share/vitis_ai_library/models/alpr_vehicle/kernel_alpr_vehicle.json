@@ -1,0 +1,19 @@
+{
+  "xclbin-location":"/usr/lib/dpu.xclbin",
+  "ivas-library-repo": "/opt/uncanny/lib/",
+  "element-mode":"inplace",
+  "kernels" :[
+    {
+      "library-name":"libivas_xdpuinfer.so",
+      "config": {
+	"model-name" : "alpr_vehicle",
+	"model-class" : "ALPR_VEHICLE",
+	"model-path" : "/opt/uncanny/share/vitis_ai_library/models/",
+	"run_time_model" : false,
+	"need_preprocess" : false,
+	"performance_test" : false,
+	"debug_level" : 1
+      }
+    }
+  ]
+}

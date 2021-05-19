@@ -1,0 +1,592 @@
+From 24eeee2b6b352bbff1e550a3040b056e91fdf61e Mon Sep 17 00:00:00 2001
+From: pankajd <pankajd@xilinx.com>
+Date: Thu, 11 Mar 2021 02:33:24 -0700
+Subject: [PATCH] Add ALPR and Vehicle detection model support
+
+Signed-off-by: pankajd <pankajd@xilinx.com>
+---
+ .../json_files/kernel_alpr_vehicle.json            |  19 ++
+ ivas_xdpuinfer/meson.build      |  18 +-
+ ivas_xdpuinfer/src/ivas_xalprvehicle.cpp       | 308 +++++++++++++++++++++
+ ivas_xdpuinfer/src/ivas_xalprvehicle.hpp       |  81 ++++++
+ ivas_xdpuinfer/src/ivas_xdpuinfer.cpp          |  24 +-
+ ivas_xdpuinfer/src/ivas_xdpumodels.hpp         |   2 +
+ ivas_xdpuinfer/src/ivas_xdputest.cpp           |   1 +
+ meson_options.txt               |   2 +
+ 8 files changed, 449 insertions(+), 6 deletions(-)
+ create mode 100755 ivas_xdpuinfer/json_files/kernel_alpr_vehicle.json
+ create mode 100755 ivas_xdpuinfer/src/ivas_xalprvehicle.cpp
+ create mode 100755 ivas_xdpuinfer/src/ivas_xalprvehicle.hpp
+
+diff --git a/ivas_xdpuinfer/json_files/kernel_alpr_vehicle.json b/ivas_xdpuinfer/json_files/kernel_alpr_vehicle.json
+new file mode 100755
+index 0000000..0396903
+--- /dev/null
++++ b/ivas_xdpuinfer/json_files/kernel_alpr_vehicle.json
+@@ -0,0 +1,19 @@
++{
++  "xclbin-location":"/usr/lib/dpu.xclbin",
++  "ivas-library-repo": "/usr/lib/",
++  "element-mode":"inplace",
++  "kernels" :[
++    {
++      "library-name":"libivas_xdpuinfer.so",
++      "config": {
++	"model-name" : "alpr_vehicle",
++	"model-class" : "ALPR_VEHICLE",
++	"model-path" : "/usr/share/vitis_ai_library/models/",
++	"run_time_model" : false,
++	"need_preprocess" : false,
++	"performance_test" : false,
++	"debug_level" : 1
++      }
++    }
++  ]
++}
+diff --git a/ivas_xdpuinfer/meson.build b/ivas_xdpuinfer/meson.build
+index 6c1a889..a7e8dc5 100644
+--- a/ivas_xdpuinfer/meson.build
++++ b/ivas_xdpuinfer/meson.build
+@@ -86,19 +86,29 @@ else
+   yolov2_dep = []
+ endif
+ 
++#ADD ALPR_VEHICLE
++if get_option('ALPR_VEHICLE') != '0'
++  add_project_arguments('-DENABLE_TVM_ALPR_VEHICLE_DETECT', language : 'c')
++  add_project_arguments('-DENABLE_TVM_ALPR_VEHICLE_DETECT', language : 'cpp')
++  alpr_vehicle_dep = dependency('tvm-runtime', version : '>= 1.0', required: true)
++  sources += [
++    'src/ivas_xalprvehicle.cpp',
++  ]
++else
++  alpr_vehicle_dep = []
++endif
++
+ vartutil_dep = cc.find_library('vart-util', dirs : ['/usr/lib/'])
+ xnnpp_dep = cc.find_library('xnnpp-xnnpp', dirs : ['/usr/lib/'])
+ vitisconfig_dep = cc.find_library('vitis_ai_library-model_config', dirs : ['/usr/lib/'])
+ dputask_dep = cc.find_library('vitis_ai_library-dpu_task', dirs : ['/usr/lib/'])
+ opencvcore_dep = cc.find_library('opencv_core')
+ 
+-#vitisinc_dir = include_directories('/proj/ipeng3/saurabhs/nobkup/2020_1_sysroot/sysroots/aarch64-xilinx-linux/usr/include/vitis')
+-
+ ivas_xdpuinfer = library('ivas_xdpuinfer',
+   sources,
+-  cpp_args : [gst_plugins_ivas_args, '-std=c++11'],
++  cpp_args : [gst_plugins_ivas_args, '-std=c++14'],
+   include_directories : [configinc],
+-  dependencies : [gstvideo_dep, gst_dep, xrt_dep, jansson_dep, ivasutils_dep, gstivasinfermeta_dep, ivasinputmeta_dep, opencvcore_dep, vartutil_dep, xnnpp_dep, vitisconfig_dep, dputask_dep, classi_dep, yolov3_dep, facedetect_dep, ssd_dep, tfssd_dep, yolov2_dep, refinedet_dep],
++  dependencies : [gstvideo_dep, gst_dep, xrt_dep, jansson_dep, ivasutils_dep, gstivasinfermeta_dep, ivasinputmeta_dep, alpr_vehicle_dep, opencvcore_dep, vartutil_dep, xnnpp_dep, vitisconfig_dep, dputask_dep, classi_dep, yolov3_dep, facedetect_dep, ssd_dep, tfssd_dep, yolov2_dep, refinedet_dep],
+   install : true,
+ )
+ 
+diff --git a/ivas_xdpuinfer/src/ivas_xalprvehicle.cpp b/ivas_xdpuinfer/src/ivas_xalprvehicle.cpp
+new file mode 100755
+index 0000000..e36300f
+--- /dev/null
++++ b/ivas_xdpuinfer/src/ivas_xalprvehicle.cpp
+@@ -0,0 +1,308 @@
++/*
++ * Copyright 2020 Xilinx, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "ivas_xalprvehicle.hpp"
++
++static float _iou(struct bbox_attrs *bbox1, struct bbox_attrs *bbox2)
++{
++  float int_x0, int_y0, int_x1, int_y1;
++  float int_area, b1_area, b2_area, iou;
++  
++  int_x0 = std::max(bbox1->xmin, bbox2->xmin);
++  int_y0 = std::max(bbox1->ymin, bbox2->ymin);
++  int_x1 = std::min(bbox1->xmax, bbox2->xmax);
++  int_y1 = std::min(bbox1->ymax, bbox2->ymax);
++  
++  int_area = std::max(int_x1 - int_x0, float(0)) * std::max(int_y1 - int_y0, float(0));
++
++  b1_area = (bbox1->xmax - bbox1->xmin) * (bbox1->ymax - bbox1->ymin);
++  b2_area = (bbox2->xmax - bbox2->xmin) * (bbox2->ymax - bbox2->ymin);
++  
++  //we add small epsilon of 1e-05 to avoid division by 0
++  iou = int_area / (b1_area + b2_area - int_area + 1e-05);
++  return iou;
++}
++
++/* Compare prediction scores to sort tensors in descending order of confidence score */
++static bool compare_conf_score(struct pred_out_format p1, struct pred_out_format p2)
++{
++  return (p1.confidence_score > p2.confidence_score);
++}
++
++/* Non max suppression to return final prediction result */
++static vector<struct pred_out_format> non_max_suppression(void *predictions, float conf_thresh, float nms_thresh)
++{
++  float (&pred_tensor)[OUTPUT_TENSOR_ENTRIES][OUTPUT_TENSOR_SIZE] = 
++      *reinterpret_cast<float (*)[OUTPUT_TENSOR_ENTRIES][OUTPUT_TENSOR_SIZE]>(predictions);
++  struct out_tensor_format *out_tensor = (struct out_tensor_format *)&pred_tensor[0][0];
++  
++  vector<struct pred_out_format> pred_out_vec[NUM_OBJECT_CLASSES];
++  vector<struct pred_out_format> result;
++  
++  float *iter;
++  float *iter_last;
++  float *max_iter;
++  int pred_class_index;
++  float iou;
++  
++  /* Find out all the tensors that has confidence greater than the requested */
++  for (int entry = 0; entry < OUTPUT_TENSOR_ENTRIES; entry++) {
++    if (out_tensor->confidence_score > conf_thresh) {
++      iter = (float *)(&out_tensor->obj_class[0]);
++      iter_last = (float *)(&out_tensor->obj_class[NUM_OBJECT_CLASSES - 1]);
++      max_iter = std::max_element(iter, iter_last+1);
++      pred_class_index = std::distance(iter, max_iter);
++      
++      pred_out_vec[pred_class_index].push_back({out_tensor->bbox, out_tensor->confidence_score, pred_class_index});     
++    }
++    out_tensor ++;
++  }
++
++  /* Find Intersection Over Union (IOU) between predicted entries of each class */
++  for (int class_id = 0; class_id < NUM_OBJECT_CLASSES; class_id++) {
++    /* Sort the predictions in descending order of confidence score */
++    std::sort(pred_out_vec[class_id].begin(), pred_out_vec[class_id].end(), compare_conf_score);
++
++    while (pred_out_vec[class_id].size()) {
++      int num_class_entries = pred_out_vec[class_id].size();
++
++      result.push_back(pred_out_vec[class_id][0]);
++
++      for (int i = 1, cmp_id = 1; i < num_class_entries; i++) {
++        iou = _iou(&pred_out_vec[class_id][cmp_id].bbox, &pred_out_vec[class_id][0].bbox);
++        if (iou > nms_thresh) {
++          pred_out_vec[class_id].erase(pred_out_vec[class_id].begin() + cmp_id);
++        } else {
++          cmp_id ++;
++        }
++      }
++      pred_out_vec[class_id].erase(pred_out_vec[class_id].begin());
++    }
++  }
++  
++  return result;
++}
++
++#ifdef __ARM_NEON
++static void convert_scale_u8_f32(uint8_t* src, float scale, int size, float* dst)
++{
++  float32x4_t _scale = vdupq_n_f32(scale);
++
++  uint8x16_t src_u8;
++  uint8x8x2_t src_u8_lh;
++  uint16x8x2_t tmp_u16_2;
++  uint16x4x4_t t_u16x4x4;
++  uint32x4x4_t t_u32x4x4;
++  float32x4x4_t dst_f32;
++
++  for (int i = 0; i < size / 16; i++) {
++      src_u8 = vld1q_u8(src + i * 16);
++
++      src_u8_lh.val[0] = vget_low_u8(src_u8);
++      src_u8_lh.val[1] = vget_high_u8(src_u8);
++
++      tmp_u16_2.val[0] = vmovl_u8(src_u8_lh.val[0]);
++      tmp_u16_2.val[1] = vmovl_u8(src_u8_lh.val[1]);
++
++      t_u16x4x4.val[0] = vget_low_u16(tmp_u16_2.val[0]);
++      t_u16x4x4.val[1] = vget_high_u16(tmp_u16_2.val[0]);
++      t_u16x4x4.val[2] = vget_low_u16(tmp_u16_2.val[1]);
++      t_u16x4x4.val[3] = vget_high_u16(tmp_u16_2.val[1]);
++
++      for (int j = 0; j < 4; j++) {
++          t_u32x4x4.val[j] = vmovl_u16(t_u16x4x4.val[j]);
++          dst_f32.val[j] = vmulq_f32(vcvtq_f32_u32(t_u32x4x4.val[j]), _scale);
++          vst1q_f32(dst + i * 16 + 4 * j, dst_f32.val[j]);
++      }
++  }
++
++  if (size % 16) {
++      for (int i = size / 16 * 16; i < size; i++) {
++          dst[i] = (float)src[i] * scale;
++      }
++  }
++}
++#endif 
++
++ivas_xalprvehicle::ivas_xalprvehicle (ivas_xkpriv * kpriv, const std::string & model_name,
++    bool need_preprocess)
++{
++  DLContext ctx{kDLCPU, 0};
++  int dtype_code = kDLFloat;
++  int dtype_bits = 32;
++  int dtype_lanes = 1;
++  int device_type = kDLCPU;
++  int device_id = 0;
++  int in_ndim = 4;
++  int64_t in_shape[4] = {1, MODEL_INPUT_HEIGHT, MODEL_INPUT_WIDTH, MODEL_INPUT_CHANNELS};
++  int out_ndim = 3;
++  int64_t out_shape[3] = {1,OUTPUT_TENSOR_ENTRIES, OUTPUT_TENSOR_SIZE};
++  
++  log_level = kpriv->log_level;
++  kpriv->labelflags = IVAS_XLABEL_REQUIRED;
++  LOG_MESSAGE (LOG_LEVEL_DEBUG, kpriv->log_level, "enter");
++
++  if (kpriv->labelptr == NULL) {
++    LOG_MESSAGE (LOG_LEVEL_ERROR, kpriv->log_level, "label not found");
++    kpriv->labelflags |= IVAS_XLABEL_NOT_FOUND;
++  } else
++    kpriv->labelflags |= IVAS_XLABEL_FOUND;
++
++  tvm::runtime::Module mod_factory = tvm::runtime::Module::LoadFromFile(model_name);
++  module = mod_factory.GetFunction("default")(ctx);
++  
++  /* Allocate input and output tensors memory */
++  TVMArrayAlloc(in_shape, in_ndim, dtype_code, dtype_bits, dtype_lanes, device_type, device_id, &input_tensor);
++  TVMArrayAlloc(out_shape, out_ndim, dtype_code, dtype_bits, dtype_lanes, device_type, device_id, &output_tensor);
++  
++  /* Assign TVM runtime function pointers */
++  set_input = module.GetFunction("set_input");
++  run_model = module.GetFunction("run");
++  get_output = module.GetFunction("get_output");
++  
++  LOG_MESSAGE (LOG_LEVEL_DEBUG, kpriv->log_level, "exit");
++}
++
++int
++ivas_xalprvehicle::run (ivas_xkpriv * kpriv, const cv::Mat & image,
++    GstInferenceMeta * infer_meta)
++{
++  vector<struct pred_out_format> pred_result;
++  
++  LOG_MESSAGE (LOG_LEVEL_DEBUG, kpriv->log_level, "enter");
++
++  /* Convert pre-processed image to float representation */
++#ifdef __ARM_NEON
++  convert_scale_u8_f32((uint8_t*)(image.data), PRE_PROCESS_SCALE,
++      (image.cols * image.rows * image.channels()), (float*)(input_tensor->data));
++#else
++  float *data = (float *)(input_tensor->data);
++  uint8_t *img_data = image.data;
++  for (int i = 0; i < (image.cols * image.rows * image.channels()); ++i)
++  {
++    data[i] = (float)img_data[i] * PRE_PROCESS_SCALE;
++  }
++#endif
++  
++  /* Set the input tensor to the input node of the model graph */
++  set_input("inputs", input_tensor);
++  
++  /* Run the model on the input data */
++  run_model();
++  
++  /* Retrieve pointer to output tensor */
++  get_output(0, output_tensor);
++  
++  //TODO: Configure confidence threshold and NMS threshold from json file
++  pred_result = non_max_suppression(output_tensor->data, CONFIDENCE_THRESHOLD, NMS_THRESHOLD);
++
++  labels *lptr;
++  int cols = image.cols;
++  int rows = image.rows;
++  char *pstr;  /* prediction string */
++
++  if (kpriv->labelptr == NULL) {
++    LOG_MESSAGE (LOG_LEVEL_ERROR, kpriv->log_level, "label not found");
++    return false;
++  }
++
++  if (NULL == infer_meta->prediction) {
++    infer_meta->prediction = gst_inference_prediction_new ();
++    infer_meta->prediction->bbox.width = cols;
++    infer_meta->prediction->bbox.height = rows;
++  } else {
++    infer_meta->prediction->bbox.width = cols;
++    infer_meta->prediction->bbox.height = rows;
++  }
++  LOG_MESSAGE (LOG_LEVEL_DEBUG, kpriv->log_level,
++      " IN width %d, height %d infer ptr %p", cols, rows, infer_meta);
++  LOG_MESSAGE (LOG_LEVEL_DEBUG, kpriv->log_level, "root prediction ptr %p",
++      infer_meta->prediction);
++
++  for (auto & box:pred_result) {
++    int label = box.class_label;
++    float xmin = box.bbox.xmin;
++    float ymin = box.bbox.ymin;
++    float xmax = box.bbox.xmax;
++    float ymax = box.bbox.ymax;
++    if (xmin < 0.)
++      xmin = 1.;
++    if (ymin < 0.)
++      ymin = 1.;
++    if (xmax > cols)
++      xmax = cols;
++    if (ymax > rows)
++      ymax = rows;
++    float confidence = box.confidence_score;
++
++    BoundingBox bbox;
++    GstInferencePrediction *predict;
++    GstInferenceClassification *c = NULL;
++
++    bbox.x = xmin;
++    bbox.y = ymin;
++    bbox.width = xmax - xmin;
++    bbox.height = ymax - ymin;
++
++    predict = gst_inference_prediction_new_full (&bbox);
++    lptr = kpriv->labelptr + label;
++
++    c = gst_inference_classification_new_full (label, confidence,
++        lptr->display_name.c_str (), 0, NULL, NULL, NULL);
++    gst_inference_prediction_append_classification (predict, c);
++
++    gst_inference_prediction_append (infer_meta->prediction, predict);
++
++    LOG_MESSAGE (LOG_LEVEL_INFO, kpriv->log_level,
++        "RESULT: %s(%d) %f %f %f %f (%f)", lptr->display_name.c_str (), label,
++        xmin, ymin, xmax, ymax, confidence);
++  }
++  pstr = gst_inference_prediction_to_string (infer_meta->prediction);
++  LOG_MESSAGE (LOG_LEVEL_DEBUG, kpriv->log_level, "prediction tree : \n%s",
++      pstr);
++  free(pstr);
++  LOG_MESSAGE (LOG_LEVEL_INFO, kpriv->log_level, " ");
++
++  return true;
++}
++
++int
++ivas_xalprvehicle::requiredwidth (void)
++{
++  LOG_MESSAGE (LOG_LEVEL_DEBUG, log_level, "enter");
++  return MODEL_INPUT_WIDTH;
++}
++
++int
++ivas_xalprvehicle::requiredheight (void)
++{
++  LOG_MESSAGE (LOG_LEVEL_DEBUG, log_level, "enter");
++  return MODEL_INPUT_HEIGHT;
++}
++
++int
++ivas_xalprvehicle::close (void)
++{
++  LOG_MESSAGE (LOG_LEVEL_DEBUG, log_level, "enter");
++  return true;
++}
++
++ivas_xalprvehicle::~ivas_xalprvehicle ()
++{
++  LOG_MESSAGE (LOG_LEVEL_DEBUG, log_level, "enter");
++  TVMArrayFree(input_tensor);
++  TVMArrayFree(output_tensor);
++}
+diff --git a/ivas_xdpuinfer/src/ivas_xalprvehicle.hpp b/ivas_xdpuinfer/src/ivas_xalprvehicle.hpp
+new file mode 100755
+index 0000000..76a1a61
+--- /dev/null
++++ b/ivas_xdpuinfer/src/ivas_xalprvehicle.hpp
+@@ -0,0 +1,81 @@
++/*
++ * Copyright 2020 Xilinx, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#pragma once
++#include "ivas_xdpupriv.hpp"
++
++#include <dlpack/dlpack.h>
++#include <tvm/runtime/module.h>
++#include <tvm/runtime/packed_func.h>
++
++using namespace std;
++using namespace cv;
++
++#define MODEL_INPUT_HEIGHT (320)
++#define MODEL_INPUT_WIDTH (320)
++#define MODEL_INPUT_CHANNELS (3)
++#define OUTPUT_TENSOR_ENTRIES (12600)
++#define OUTPUT_TENSOR_SIZE (14)
++#define NUM_OBJECT_CLASSES (9)
++
++#define PRE_PROCESS_SCALE (0.0039216f)
++#define CONFIDENCE_THRESHOLD (0.5)
++#define NMS_THRESHOLD (0.45)
++
++struct bbox_attrs {
++  float xmin;
++  float ymin;
++  float xmax;
++  float ymax;
++};
++
++struct out_tensor_format {
++  struct bbox_attrs bbox;
++  float confidence_score;
++  float obj_class[NUM_OBJECT_CLASSES];
++};
++
++struct pred_out_format {
++  struct bbox_attrs bbox;
++  float confidence_score;
++  int class_label;
++};
++
++class ivas_xalprvehicle:public ivas_xdpumodel
++{
++
++  int log_level = 0;
++  tvm::runtime::Module module;
++  DLTensor* input_tensor;
++  DLTensor* output_tensor;
++  tvm::runtime::PackedFunc set_input;
++  tvm::runtime::PackedFunc run_model;
++  tvm::runtime::PackedFunc get_output;
++
++public:
++
++  ivas_xalprvehicle (ivas_xkpriv * kpriv, const std::string & model_name,
++    bool need_preprocess);
++
++  virtual int run (ivas_xkpriv * kpriv, const cv::Mat & image,
++    GstInferenceMeta * ivas_meta);
++
++  virtual int requiredwidth (void);
++  virtual int requiredheight (void);
++  virtual int close (void);
++
++  ~ ivas_xalprvehicle ();
++};
+diff --git a/ivas_xdpuinfer/src/ivas_xdpuinfer.cpp b/ivas_xdpuinfer/src/ivas_xdpuinfer.cpp
+index 410d582..528ebde 100755
+--- a/ivas_xdpuinfer/src/ivas_xdpuinfer.cpp
++++ b/ivas_xdpuinfer/src/ivas_xdpuinfer.cpp
+@@ -34,7 +34,7 @@
+  *      "model-name" : "resnet50",
+  *      "model-class" : "CLASSIFICATION",
+  *      "model-path" : "/usr/share/vitis_ai_library/models/",
+- *      "run_time_model" : flase,
++ *      "run_time_model" : false,
+  *      "need_preprocess" : true,
+  *      "performance_test" : true,
+  *      "debug_level" : 1
+@@ -97,6 +97,9 @@
+ #ifdef ENABLE_YOLOV2
+ #include "ivas_xyolov2.hpp"
+ #endif
++#ifdef ENABLE_TVM_ALPR_VEHICLE_DETECT
++#include "ivas_xalprvehicle.hpp"
++#endif 
+ 
+ using namespace cv;
+ using namespace std;
+@@ -136,6 +139,16 @@ modelexits (ivas_xkpriv * kpriv)
+       kpriv->modelpath + "/" + kpriv->modelname + "/" + kpriv->modelname +
+       ".prototxt";
+ 
++#ifdef ENABLE_TVM_ALPR_VEHICLE_DETECT
++  auto so_name =
++      kpriv->modelpath + "/" + kpriv->modelname + "/" + kpriv->modelname +
++      ".so";
++
++  /* .so file is for TVM flow */
++  if (fileexists (so_name))
++    return so_name;
++#endif
++
+   if (!fileexists (prototxt_name)) {
+     LOG_MESSAGE (LOG_LEVEL_ERROR, kpriv->log_level, "%s not found",
+         prototxt_name.c_str ());
+@@ -454,6 +467,13 @@ ivas_xinitmodel (ivas_xkpriv * kpriv, int modelclass)
+       break;
+     }
+ #endif
++#ifdef ENABLE_TVM_ALPR_VEHICLE_DETECT
++    case IVAS_XCLASS_ALPR_VEHICLE:
++    {
++      model = new ivas_xalprvehicle (kpriv, kpriv->elfname, kpriv->need_preprocess);
++      break;
++    }
++#endif
+ 
+     default:
+       LOG_MESSAGE (LOG_LEVEL_ERROR, kpriv->log_level, "Not supported model");
+@@ -592,7 +612,7 @@ extern "C"
+     if (kpriv->elfname.empty ()) {
+       goto err;
+     }
+-    printf ("%s %d\n", __func__, __LINE__);
++
+ 
+     LOG_MESSAGE (LOG_LEVEL_INFO, kpriv->log_level, "model-name = %s\n",
+         (char *) json_string_value (val));
+diff --git a/ivas_xdpuinfer/src/ivas_xdpumodels.hpp b/ivas_xdpuinfer/src/ivas_xdpumodels.hpp
+index 123b6b8..10879c3 100755
+--- a/ivas_xdpuinfer/src/ivas_xdpumodels.hpp
++++ b/ivas_xdpuinfer/src/ivas_xdpumodels.hpp
+@@ -29,6 +29,7 @@ enum
+   IVAS_XCLASS_REFINEDET,
+   IVAS_XCLASS_TFSSD,
+   IVAS_XCLASS_YOLOV2,
++  IVAS_XCLASS_ALPR_VEHICLE,
+ 
+   IVAS_XCLASS_NOTFOUND
+ };
+@@ -43,6 +44,7 @@ static const char *ivas_xmodelclass[IVAS_XCLASS_NOTFOUND + 1] = {
+   [IVAS_XCLASS_REFINEDET] = "REFINEDET",
+   [IVAS_XCLASS_TFSSD] = "TFSSD",
+   [IVAS_XCLASS_YOLOV2] = "YOLOV2",
++  [IVAS_XCLASS_ALPR_VEHICLE] = "ALPR_VEHICLE",
+ 
+   /* Add model above this */
+   [IVAS_XCLASS_NOTFOUND] = ""
+diff --git a/ivas_xdpuinfer/src/ivas_xdputest.cpp b/ivas_xdpuinfer/src/ivas_xdputest.cpp
+index b863833..e1adffa 100755
+--- a/ivas_xdpuinfer/src/ivas_xdputest.cpp
++++ b/ivas_xdpuinfer/src/ivas_xdputest.cpp
+@@ -50,6 +50,7 @@ static const char *ivas_xmodelclass[IVAS_XCLASS_NOTFOUND + 1] = {
+   [IVAS_XCLASS_REFINEDET] = "REFINEDET",
+   [IVAS_XCLASS_TFSSD] = "TFSSD",
+   [IVAS_XCLASS_YOLOV2] = "YOLOV2",
++  [IVAS_XCLASS_ALPR_VEHICLE] = "ALPR_VEHICLE",
+ 
+   /* Add model above this */
+   [IVAS_XCLASS_NOTFOUND] = ""
+diff --git a/meson_options.txt b/meson_options.txt
+index 28d2446..fd4bc1c 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -20,3 +20,5 @@ option('TFSSD', type: 'string', value: '1',
+        description: 'Enable disable TFSSD models')
+ option('YOLOV2', type: 'string', value: '1',
+        description: 'Enable disable YOLOV2 models')
++option('ALPR_VEHICLE', type: 'string', value: '1',
++       description: 'Enable disable ALPR and Vehicle detection model')
+-- 
+2.7.4
+

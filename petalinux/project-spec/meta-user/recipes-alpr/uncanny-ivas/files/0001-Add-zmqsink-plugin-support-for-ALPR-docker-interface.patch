@@ -1,0 +1,1720 @@
+From 6e5adf422c4c2b6e26075fff80a46da4428eaf3e Mon Sep 17 00:00:00 2001
+From: pankajd <pankajd@xilinx.com>
+Date: Mon, 12 Apr 2021 03:10:45 -0600
+Subject: [PATCH 1/2] Add zmqsink plugin support for ALPR docker interface
+
+Signed-off-by: pankajd <pankajd@xilinx.com>
+---
+ ext/meson.build                |    1 +
+ ext/zmqsink/gstivas_xzmqsink.c | 1555 +++++++++++++++++++++++
+ ext/zmqsink/gstivas_xzmqsink.h |   76 ++
+ ext/zmqsink/meson.build        |   18 +
+ meson.build                    |    1 +
+ meson_options.txt              |    1 +
+ 6 files changed, 1652 insertions(+)
+ create mode 100644 ext/meson.build
+ create mode 100644 ext/zmqsink/gstivas_xzmqsink.c
+ create mode 100644 ext/zmqsink/gstivas_xzmqsink.h
+ create mode 100644 ext/zmqsink/meson.build
+
+diff --git a/ext/meson.build b/ext/meson.build
+new file mode 100644
+index 0000000..6d128f2
+--- /dev/null
++++ b/ext/meson.build
+@@ -0,0 +1 @@
++subdir('zmqsink')
+diff --git a/ext/zmqsink/gstivas_xzmqsink.c b/ext/zmqsink/gstivas_xzmqsink.c
+new file mode 100644
+index 0000000..e6897b6
+--- /dev/null
++++ b/ext/zmqsink/gstivas_xzmqsink.c
+@@ -0,0 +1,1555 @@
++/*
++ * Copyright (C) 2020 - 2021 Xilinx, Inc.  All rights reserved.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation the
++ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
++ * sell copies of the Software, and to permit persons to whom the Software
++ * is furnished to do so, subject to the following conditions:
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
++ * KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
++ * EVENT SHALL XILINX BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
++ * WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT
++ * OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE. Except as contained in this notice, the name of the Xilinx shall
++ * not be used in advertising or otherwise to promote the sale, use or other
++ * dealings in this Software without prior written authorization from Xilinx.
++ */
++ 
++/*
++ * TODO:
++ * - On EOS, check whether all packets are transmitted or not to peer
++ * - Need to add connection time-out : ZMQ_CONNECT_TIMEOUT socketopt
++ * - Keep exploring socketopt flags
++ * - add property for send High water mark
++ * - handling dmabuf & XRT BO to achieve zero copy
++ * - getting socket options from key value pair instead of accepting one property for each sock option
++ */
++
++#include <errno.h>
++
++#ifdef HAVE_CONFIG_H
++#include "config.h"
++#endif
++
++#include <zmq.h>
++#include <jansson.h>
++#include <time.h>
++
++#include "gstivas_xzmqsink.h"
++#include <gst/ivas/gstivasallocator.h>
++#include <gst/allocators/gstdmabuf.h>
++#include <gst/video/gstvideometa.h>
++#include <gst/ivas/gstinferencemeta.h>
++
++#define DEFAULT_DEVICE_INDEX 0
++#define MIN_POOL_BUFFERS 2
++#ifdef XLNX_PCIe_PLATFORM
++#define USE_DMABUF 0
++#else
++#define USE_DMABUF 1
++#endif
++#define ALPR_CLASS_ID_LP (8)
++#define LP_XOFFSET_PERCENT (2)
++
++#undef ZERO_COPY_SUPPORTED
++#undef SINK_EVENT_SUPPORTED
++//#define DUMP_JSON_YDATA
++#define ADD_XOFFSET_TO_LP
++
++GST_DEBUG_CATEGORY_STATIC (ivas_xzmqsink_debug);
++#define GST_CAT_DEFAULT (ivas_xzmqsink_debug)
++
++static GstStaticPadTemplate sinktemplate = GST_STATIC_PAD_TEMPLATE ("sink",
++    GST_PAD_SINK,
++    GST_PAD_ALWAYS,
++    GST_STATIC_CAPS_ANY);
++
++#define SEND_DATA_HIGH_WM 2
++#define RECV_DATA_HIGH_WM 2
++
++enum
++{
++  PROP_0,
++  PROP_ENDPOINT,
++  PROP_PATTERN,
++  PROP_SEND_META,
++  PROP_IPC_ZEROCOPY,
++  PROP_SOCKET_OPTIONS,
++};
++
++enum
++{
++  SIGNAL_0,
++  SIGNAL_REPLY_MESSAGE,
++  SIGNAL_LAST,
++};
++
++static guint gst_ivas_xzmq_sink_signals[SIGNAL_LAST] = { 0 };
++
++struct _GstIvas_XZmqSinkPrivate
++{
++  void *context;
++  void *socket;
++
++  /* zero copy IPC */
++  gboolean has_zerocopy;
++  GThread *zc_thread;
++  void *zc_socket;
++  gboolean last_zc_error;
++  GHashTable *zc_bufs;
++  guint64 framecount;
++  guint y_data_sz;
++};
++
++typedef struct
++{
++  GstBuffer *buffer;
++  GstMapInfo map_info;
++} Ivas_XZmqDataCbObj;
++
++typedef enum
++{
++  IVAS_ZMQ_TYPE_STRING,
++  IVAS_ZMQ_TYPE_INT,
++  IVAS_ZMQ_TYPE_INT64,
++  IVAS_ZMQ_TYPE_REAL,
++} IvasZmqValueType;
++
++typedef enum
++{
++  IVAS_ZMQ_OPTION_READ,
++  IVAS_ZMQ_OPTION_WRITE,
++} IvasZmqValueFlags;
++
++#define IVAS_ZMQ_OPTION_READWRITE (IVAS_ZMQ_OPTION_READ | IVAS_ZMQ_OPTION_WRITE)
++
++typedef struct
++{
++  const gint option;
++  const gchar *name;
++  IvasZmqValueType opt_type;
++  IvasZmqValueFlags flags;
++} IvasZmqSocket;
++
++/* Socket options : based on 4.2 version http://api.zeromq.org/4-2:zmq-setsockopt */
++static IvasZmqSocket socket_options[] = {
++  {ZMQ_AFFINITY, "ZMQ_AFFINITY", IVAS_ZMQ_TYPE_INT64,
++      IVAS_ZMQ_OPTION_READWRITE},
++  //{ZMQ_ROUTING_ID, "ZMQ_ROUTING_ID", IVAS_ZMQ_TYPE_STRING},
++  {ZMQ_SUBSCRIBE, "ZMQ_SUBSCRIBE", IVAS_ZMQ_TYPE_STRING, IVAS_ZMQ_OPTION_WRITE},
++  {ZMQ_UNSUBSCRIBE, "ZMQ_UNSUBSCRIBE", IVAS_ZMQ_TYPE_STRING,
++      IVAS_ZMQ_OPTION_WRITE},
++  {ZMQ_RATE, "ZMQ_RATE", IVAS_ZMQ_TYPE_INT, IVAS_ZMQ_OPTION_READWRITE},
++  {ZMQ_RECOVERY_IVL, "ZMQ_RECOVERY_IVL", IVAS_ZMQ_TYPE_INT,
++      IVAS_ZMQ_OPTION_READWRITE},
++  {ZMQ_SNDBUF, "ZMQ_SNDBUF", IVAS_ZMQ_TYPE_INT, IVAS_ZMQ_OPTION_READWRITE},
++  {ZMQ_RCVBUF, "ZMQ_RCVBUF", IVAS_ZMQ_TYPE_INT, IVAS_ZMQ_OPTION_WRITE},
++  {ZMQ_FD, "ZMQ_FD", IVAS_ZMQ_TYPE_INT, IVAS_ZMQ_OPTION_READ},
++  {ZMQ_EVENTS, "ZMQ_EVENTS", IVAS_ZMQ_TYPE_INT, IVAS_ZMQ_OPTION_READ},
++  {ZMQ_TYPE, "ZMQ_TYPE", IVAS_ZMQ_TYPE_INT, IVAS_ZMQ_OPTION_READ},
++  {ZMQ_LINGER, "ZMQ_LINGER", IVAS_ZMQ_TYPE_INT, IVAS_ZMQ_OPTION_READWRITE},
++  {ZMQ_RECONNECT_IVL, "ZMQ_RECONNECT_IVL", IVAS_ZMQ_TYPE_INT,
++      IVAS_ZMQ_OPTION_READWRITE},
++  {ZMQ_BACKLOG, "ZMQ_BACKLOG", IVAS_ZMQ_TYPE_INT, IVAS_ZMQ_OPTION_READWRITE},
++  {ZMQ_RECONNECT_IVL_MAX, "ZMQ_RECONNECT_IVL_MAX", IVAS_ZMQ_TYPE_INT,
++      IVAS_ZMQ_OPTION_READWRITE},
++  {ZMQ_MAXMSGSIZE, "ZMQ_MAXMSGSIZE", IVAS_ZMQ_TYPE_INT64,
++      IVAS_ZMQ_OPTION_READWRITE},
++  {ZMQ_SNDHWM, "ZMQ_SNDHWM", IVAS_ZMQ_TYPE_INT, IVAS_ZMQ_OPTION_READWRITE},
++  {ZMQ_RCVHWM, "ZMQ_RCVHWM", IVAS_ZMQ_TYPE_INT, IVAS_ZMQ_OPTION_READWRITE},
++  {ZMQ_MULTICAST_HOPS, "ZMQ_MULTICAST_HOPS", IVAS_ZMQ_TYPE_INT,
++      IVAS_ZMQ_OPTION_READWRITE},
++  {ZMQ_RCVTIMEO, "ZMQ_RCVTIMEO", IVAS_ZMQ_TYPE_INT, IVAS_ZMQ_OPTION_READWRITE},
++  {ZMQ_SNDTIMEO, "ZMQ_SNDTIMEO", IVAS_ZMQ_TYPE_INT, IVAS_ZMQ_OPTION_READWRITE},
++  {ZMQ_LAST_ENDPOINT, "ZMQ_LAST_ENDPOINT", IVAS_ZMQ_TYPE_STRING,
++      IVAS_ZMQ_OPTION_READ},
++  {ZMQ_ROUTER_MANDATORY, "ZMQ_ROUTER_MANDATORY", IVAS_ZMQ_TYPE_INT,
++      IVAS_ZMQ_OPTION_WRITE},
++  {ZMQ_TCP_KEEPALIVE, "ZMQ_TCP_KEEPALIVE", IVAS_ZMQ_TYPE_INT,
++      IVAS_ZMQ_OPTION_READWRITE},
++  {ZMQ_TCP_KEEPALIVE_CNT, "ZMQ_TCP_KEEPALIVE_CNT", IVAS_ZMQ_TYPE_INT,
++      IVAS_ZMQ_OPTION_READWRITE},
++  {ZMQ_TCP_KEEPALIVE_IDLE, "ZMQ_TCP_KEEPALIVE_IDLE", IVAS_ZMQ_TYPE_INT,
++      IVAS_ZMQ_OPTION_READWRITE},
++  {ZMQ_TCP_KEEPALIVE_INTVL, "ZMQ_TCP_KEEPALIVE_INTVL", IVAS_ZMQ_TYPE_INT,
++      IVAS_ZMQ_OPTION_READWRITE},
++  {ZMQ_IMMEDIATE, "ZMQ_IMMEDIATE", IVAS_ZMQ_TYPE_INT,
++      IVAS_ZMQ_OPTION_READWRITE},
++  {ZMQ_XPUB_VERBOSE, "ZMQ_XPUB_VERBOSE", IVAS_ZMQ_TYPE_INT,
++      IVAS_ZMQ_OPTION_WRITE},
++  {ZMQ_ROUTER_RAW, "ZMQ_ROUTER_RAW", IVAS_ZMQ_TYPE_INT, IVAS_ZMQ_OPTION_WRITE},
++  {ZMQ_IPV6, "ZMQ_IPV6", IVAS_ZMQ_TYPE_INT, IVAS_ZMQ_OPTION_READWRITE},
++  {ZMQ_MECHANISM, "ZMQ_MECHANISM", IVAS_ZMQ_TYPE_INT, IVAS_ZMQ_OPTION_READ},
++  {ZMQ_PLAIN_SERVER, "ZMQ_PLAIN_SERVER", IVAS_ZMQ_TYPE_INT,
++      IVAS_ZMQ_OPTION_READWRITE},
++  {ZMQ_PLAIN_USERNAME, "ZMQ_PLAIN_USERNAME", IVAS_ZMQ_TYPE_STRING,
++      IVAS_ZMQ_OPTION_READWRITE},
++  {ZMQ_PLAIN_PASSWORD, "ZMQ_PLAIN_PASSWORD", IVAS_ZMQ_TYPE_STRING,
++      IVAS_ZMQ_OPTION_READWRITE},
++  {ZMQ_CURVE_SERVER, "ZMQ_CURVE_SERVER", IVAS_ZMQ_TYPE_INT,
++      IVAS_ZMQ_OPTION_WRITE},
++  {ZMQ_CURVE_PUBLICKEY, "ZMQ_CURVE_PUBLICKEY", IVAS_ZMQ_TYPE_STRING,
++      IVAS_ZMQ_OPTION_READWRITE},
++  {ZMQ_CURVE_SECRETKEY, "ZMQ_CURVE_SECRETKEY", IVAS_ZMQ_TYPE_STRING,
++      IVAS_ZMQ_OPTION_READWRITE},
++  {ZMQ_PROBE_ROUTER, "ZMQ_PROBE_ROUTER", IVAS_ZMQ_TYPE_INT,
++      IVAS_ZMQ_OPTION_WRITE},
++  {ZMQ_REQ_CORRELATE, "ZMQ_REQ_CORRELATE", IVAS_ZMQ_TYPE_INT,
++      IVAS_ZMQ_OPTION_WRITE},
++  {ZMQ_REQ_RELAXED, "ZMQ_REQ_RELAXED", IVAS_ZMQ_TYPE_INT,
++      IVAS_ZMQ_OPTION_WRITE},
++  {ZMQ_CONFLATE, "ZMQ_CONFLATE", IVAS_ZMQ_TYPE_INT, IVAS_ZMQ_OPTION_WRITE},
++  {ZMQ_ZAP_DOMAIN, "ZMQ_ZAP_DOMAIN", IVAS_ZMQ_TYPE_STRING,
++      IVAS_ZMQ_OPTION_READWRITE},
++  {ZMQ_ROUTER_HANDOVER, "ZMQ_ROUTER_HANDOVER", IVAS_ZMQ_TYPE_INT,
++      IVAS_ZMQ_OPTION_WRITE},
++  //{ZMQ_CONNECT_ROUTING_ID, "ZMQ_CONNECT_ROUTING_ID"},
++  {ZMQ_GSSAPI_SERVER, "ZMQ_GSSAPI_SERVER", IVAS_ZMQ_TYPE_INT,
++      IVAS_ZMQ_OPTION_READWRITE},
++  {ZMQ_GSSAPI_PRINCIPAL, "ZMQ_GSSAPI_PRINCIPAL", IVAS_ZMQ_TYPE_STRING,
++      IVAS_ZMQ_OPTION_READWRITE},
++  {ZMQ_GSSAPI_SERVICE_PRINCIPAL, "ZMQ_GSSAPI_SERVICE_PRINCIPAL",
++      IVAS_ZMQ_TYPE_STRING, IVAS_ZMQ_OPTION_READWRITE},
++  {ZMQ_GSSAPI_PLAINTEXT, "ZMQ_GSSAPI_PLAINTEXT", IVAS_ZMQ_TYPE_STRING,
++      IVAS_ZMQ_OPTION_READWRITE},
++  {ZMQ_HANDSHAKE_IVL, "ZMQ_HANDSHAKE_IVL", IVAS_ZMQ_TYPE_INT,
++      IVAS_ZMQ_OPTION_READWRITE},
++  {ZMQ_SOCKS_PROXY, "ZMQ_SOCKS_PROXY", IVAS_ZMQ_TYPE_STRING,
++      IVAS_ZMQ_OPTION_READWRITE},
++  {ZMQ_XPUB_NODROP, "ZMQ_XPUB_NODROP", IVAS_ZMQ_TYPE_INT,
++      IVAS_ZMQ_OPTION_WRITE},
++  //{ZMQ_XPUB_MANUAL, "ZMQ_XPUB_MANUAL"},
++  {ZMQ_XPUB_WELCOME_MSG, "ZMQ_XPUB_WELCOME_MSG", IVAS_ZMQ_TYPE_STRING,
++      IVAS_ZMQ_OPTION_WRITE},
++  {ZMQ_STREAM_NOTIFY, "ZMQ_STREAM_NOTIFY", IVAS_ZMQ_TYPE_INT,
++      IVAS_ZMQ_OPTION_WRITE},
++  {ZMQ_INVERT_MATCHING, "ZMQ_INVERT_MATCHING", IVAS_ZMQ_TYPE_INT,
++      IVAS_ZMQ_OPTION_WRITE},
++  {ZMQ_HEARTBEAT_IVL, "ZMQ_HEARTBEAT_IVL", IVAS_ZMQ_TYPE_INT,
++      IVAS_ZMQ_OPTION_WRITE},
++  {ZMQ_HEARTBEAT_TTL, "ZMQ_HEARTBEAT_TTL", IVAS_ZMQ_TYPE_INT,
++      IVAS_ZMQ_OPTION_WRITE},
++  {ZMQ_HEARTBEAT_TIMEOUT, "ZMQ_HEARTBEAT_TIMEOUT", IVAS_ZMQ_TYPE_INT,
++      IVAS_ZMQ_OPTION_WRITE},
++  {ZMQ_XPUB_VERBOSER, "ZMQ_XPUB_VERBOSER", IVAS_ZMQ_TYPE_INT,
++      IVAS_ZMQ_OPTION_WRITE},
++  {ZMQ_CONNECT_TIMEOUT, "ZMQ_CONNECT_TIMEOUT", IVAS_ZMQ_TYPE_INT,
++      IVAS_ZMQ_OPTION_READWRITE},
++  {ZMQ_TCP_MAXRT, "ZMQ_TCP_MAXRT", IVAS_ZMQ_TYPE_INT,
++      IVAS_ZMQ_OPTION_READWRITE},
++  {ZMQ_THREAD_SAFE, "ZMQ_THREAD_SAFE", IVAS_ZMQ_TYPE_INT, IVAS_ZMQ_OPTION_READ},
++  {ZMQ_MULTICAST_MAXTPDU, "ZMQ_MULTICAST_MAXTPDU", IVAS_ZMQ_TYPE_INT,
++      IVAS_ZMQ_OPTION_READWRITE},
++  {ZMQ_VMCI_BUFFER_SIZE, "ZMQ_VMCI_BUFFER_SIZE", IVAS_ZMQ_TYPE_INT64,
++      IVAS_ZMQ_OPTION_READWRITE},
++  {ZMQ_VMCI_BUFFER_MIN_SIZE, "ZMQ_VMCI_BUFFER_MIN_SIZE", IVAS_ZMQ_TYPE_INT64,
++      IVAS_ZMQ_OPTION_READWRITE},
++  {ZMQ_VMCI_BUFFER_MAX_SIZE, "ZMQ_VMCI_BUFFER_MAX_SIZE", IVAS_ZMQ_TYPE_INT64,
++      IVAS_ZMQ_OPTION_READWRITE},
++  {ZMQ_VMCI_CONNECT_TIMEOUT, "ZMQ_VMCI_CONNECT_TIMEOUT", IVAS_ZMQ_TYPE_INT,
++      IVAS_ZMQ_OPTION_READWRITE},
++  {ZMQ_USE_FD, "ZMQ_USE_FD", IVAS_ZMQ_TYPE_INT, IVAS_ZMQ_OPTION_READWRITE},
++  // TODO: add options based on ZMQ_MAKE_VERSION macro in zmq.h
++  /*{ZMQ_GSSAPI_PRINCIPAL_NAMETYPE, "ZMQ_GSSAPI_PRINCIPAL_NAMETYPE"},
++     {ZMQ_GSSAPI_SERVICE_PRINCIPAL_NAMETYPE, "ZMQ_GSSAPI_PRINCIPAL_NAMETYPE"},
++     {ZMQ_BINDTODEVICE, "ZMQ_BINDTODEVICE"}, */
++  {0, NULL, IVAS_ZMQ_TYPE_INT, IVAS_ZMQ_OPTION_READ}
++};
++
++static void gst_ivas_xzmq_sink_finalize (GObject * gobject);
++static void gst_ivas_xzmq_sink_set_property (GObject * object, guint prop_id,
++    const GValue * value, GParamSpec * pspec);
++static void gst_ivas_xzmq_sink_get_property (GObject * object, guint prop_id,
++    GValue * value, GParamSpec * pspec);
++
++static gboolean gst_ivas_xzmq_sink_propose_allocation (GstBaseSink *sink, 
++    GstQuery *query);
++static gboolean gst_ivas_xzmq_sink_start (GstBaseSink * sink);
++static gboolean gst_ivas_xzmq_sink_stop (GstBaseSink * sink);
++static GstFlowReturn gst_ivas_xzmq_sink_render (GstBaseSink * sink,
++    GstBuffer * buffer);
++
++#ifdef SINK_EVENT_SUPPORTED
++static gboolean gst_ivas_xzmq_sink_event (GstBaseSink * bsink,
++    GstEvent * event);
++static gboolean
++ivas_xzmq_sink_send_meta_event (GstIvas_XZmqSink * sink, GstEvent * event);
++#endif //SINK_EVENT_SUPPORTED
++
++#define gst_ivas_xzmq_sink_parent_class parent_class
++G_DEFINE_TYPE_WITH_PRIVATE (GstIvas_XZmqSink, gst_ivas_xzmq_sink,
++    GST_TYPE_BASE_SINK);
++#define GST_IVAS_XZMQSINK_PRIVATE(sink) \
++  (GstIvas_XZmqSinkPrivate*)(gst_ivas_xzmq_sink_get_instance_private (sink))
++
++#define GST_IVAS_XZMQ_SINK_PATTERN (gst_ivas_xzmq_sink_pattern_type ())
++static GType
++gst_ivas_xzmq_sink_pattern_type (void)
++{
++  static const GEnumValue values[] = {
++    {IVAS_XZMQ_PATTERN_NONE, "ZMQ no pattern", "none"},
++    {IVAS_XZMQ_PATTERN_PIPELINE, "ZMQ pipeline pattern", "pipeline"},
++    {IVAS_XZMQ_PATTERN_PUBSUB, "ZMQ publish-subscribe pattern", "pub-sub"},
++    {IVAS_XZMQ_PATTERN_REQREP, "ZMQ request-reply pattern", "req-rep"},
++    {0, NULL, NULL}
++  };
++  static volatile GType id = 0;
++
++  if (g_once_init_enter ((gsize *) & id)) {
++    GType _id;
++    _id = g_enum_register_static ("GstIvasXZmqPatternType", values);
++    g_once_init_leave ((gsize *) & id, _id);
++  }
++
++  return id;
++}
++
++static void
++ivas_xzmq_sink_metadata_free_cb (void *metadata, void *user_data)
++{
++  g_free (metadata);
++}
++
++static void
++ivas_xzmq_sink_data_free_cb (void *data_ptr, void *user_data)
++{
++  Ivas_XZmqDataCbObj *cb_data = (Ivas_XZmqDataCbObj *) user_data;
++
++  gst_buffer_unmap (cb_data->buffer, &(cb_data->map_info));
++  gst_buffer_unref (cb_data->buffer);
++  g_slice_free (Ivas_XZmqDataCbObj, user_data);
++}
++
++#ifdef ZERO_COPY_SUPPORTED
++static gpointer
++ivas_xzmq_sink_zerocopy_thread (gpointer data)
++{
++  GstIvas_XZmqSink *sink = GST_IVAS_XZMQ_SINK (data);
++  zmq_msg_t msg;
++  int iret;
++  json_t *root = NULL;
++  json_t *jarr = NULL;
++  json_t *jobj = NULL;
++  json_error_t jerr;
++  gchar *zc_endpoint;
++
++  /* socket to get buffer freed on other end point */
++  sink->priv->zc_socket = zmq_socket (sink->priv->context, ZMQ_PULL);
++  if (!sink->priv->zc_socket) {
++    GST_ERROR_OBJECT (sink, "failed to create callback socket");
++    GST_ELEMENT_ERROR (sink, RESOURCE, OPEN_READ_WRITE,
++        ("zmq_socket() failed with error code %d [%s]", errno,
++            zmq_strerror (errno)), NULL);
++    return NULL;
++  }
++
++  zc_endpoint = g_strdup_printf ("%s_zc", sink->endpoint);
++
++  GST_DEBUG_OBJECT (sink, "connecting to endpoint %s", zc_endpoint);
++
++  iret = zmq_connect (sink->priv->zc_socket, zc_endpoint);
++  if (iret) {
++    GST_ELEMENT_ERROR (sink, RESOURCE, OPEN_READ_WRITE,
++        ("zmq_connect() to endpoint \"%s\" failed with error code %d [%s]",
++            zc_endpoint, errno, zmq_strerror (errno)), NULL);
++    return NULL;
++  }
++
++  g_free (zc_endpoint);
++
++  while (1) {
++    gboolean bret = FALSE;
++    guint idx;
++
++    iret = zmq_msg_init (&msg);
++    if (iret) {
++      GST_ERROR_OBJECT (sink, "failed to initialize zmq message");
++      sink->priv->last_zc_error = TRUE;
++      break;
++    }
++
++    /* receive data message */
++    iret = zmq_msg_recv (&msg, sink->priv->zc_socket, 0);
++    if (iret < 0) {
++      GST_ERROR_OBJECT (sink, "failed to receive message. reason %d [%s]",
++          errno, zmq_strerror (errno));
++      sink->priv->last_zc_error = TRUE;
++      zmq_msg_close (&msg);
++      break;
++    }
++
++    root = json_loadb (zmq_msg_data (&msg), zmq_msg_size (&msg),
++        JSON_DECODE_ANY, &jerr);
++
++    if (!root) {
++      GST_ERROR_OBJECT (sink, "failed to load json string. reason %s",
++          jerr.text);
++      sink->priv->last_zc_error = TRUE;
++      zmq_msg_close (&msg);
++      break;
++    }
++
++    jarr = json_object_get (root, "keys");
++    if (!jarr) {
++      GST_ERROR_OBJECT (sink, "failed to find keys array");
++      sink->priv->last_zc_error = TRUE;
++      zmq_msg_close (&msg);
++      break;
++    }
++
++    if (!json_is_array (jarr)) {
++      GST_ERROR_OBJECT (sink, "keys is not of array type");
++      sink->priv->last_zc_error = TRUE;
++      zmq_msg_close (&msg);
++      break;
++    }
++
++    for (idx = 0; idx < json_array_size (jarr); idx++) {
++      gint key;
++
++      jobj = json_array_get (jarr, idx);
++
++      if (!jobj) {
++        GST_ERROR_OBJECT (sink, "failed to get object at index %d", idx);
++        sink->priv->last_zc_error = TRUE;
++        zmq_msg_close (&msg);
++        break;
++      }
++
++      key = json_integer_value (jobj);
++
++      GST_LOG_OBJECT (sink, "found key %d", key);
++
++      bret = g_hash_table_remove (sink->priv->zc_bufs, GINT_TO_POINTER (key));
++      if (!bret) {
++        GST_ERROR_OBJECT (sink, "failed to find key %d", key);
++        sink->priv->last_zc_error = TRUE;
++        zmq_msg_close (&msg);
++        break;
++      }
++    }
++
++    if (root)
++      json_decref (root);
++
++    zmq_msg_close (&msg);
++  }
++
++  return NULL;
++}
++#endif // ZERO_COPY_SUPPORTED
++
++static gboolean
++ivas_xzmq_sink_set_socket_options (GstIvas_XZmqSink * sink)
++{
++  json_t *joptions = NULL;
++  json_error_t jerr;
++  int i, iret;
++
++  joptions = json_loadb (sink->socket_options, strlen (sink->socket_options),
++      JSON_DECODE_ANY, &jerr);
++
++  if (!joptions) {
++    GST_ERROR_OBJECT (sink,
++        "failed to load socket options json string. reason : %s", jerr.text);
++    return FALSE;
++  }
++
++  for (i = 0; socket_options[i].name; i++) {
++    json_t *jobj = NULL;
++
++    jobj = json_object_get (joptions, socket_options[i].name);
++    if (jobj) {
++
++      if (!(socket_options[i].flags & IVAS_ZMQ_OPTION_WRITE)) {
++        GST_WARNING_OBJECT (sink, "skipping wrong option %s for setsockopt",
++            socket_options[i].name);
++        continue;
++      }
++
++      if (socket_options[i].opt_type == IVAS_ZMQ_TYPE_STRING) {
++        const char *value = NULL;
++
++        if (!json_is_string (jobj)) {
++          GST_WARNING_OBJECT (sink, "socket option %s value is not string type",
++              socket_options[i].name);
++          continue;
++        }
++        value = json_string_value (jobj);
++
++        iret = zmq_setsockopt (sink->priv->socket, socket_options[i].option,
++            value, strlen (value));
++        if (iret) {
++          GST_ERROR_OBJECT (sink,
++              "failed to set socket option %s with value %s",
++              socket_options[i].name, value);
++          return FALSE;
++        }
++        GST_LOG_OBJECT (sink, "successfully set %s with value %s",
++            socket_options[i].name, value);
++      } else if (socket_options[i].opt_type == IVAS_ZMQ_TYPE_INT) {
++        gint value;
++
++        if (!json_is_integer (jobj)) {
++          GST_WARNING_OBJECT (sink,
++              "socket option %s value is not integer type",
++              socket_options[i].name);
++          continue;
++        }
++        value = (gint) json_integer_value (jobj);
++
++        iret = zmq_setsockopt (sink->priv->socket, socket_options[i].option,
++            &value, sizeof (value));
++        if (iret) {
++          GST_ERROR_OBJECT (sink,
++              "failed to set socket option %s with value %d",
++              socket_options[i].name, value);
++          return FALSE;
++        }
++        GST_LOG_OBJECT (sink, "successfully set %s with value %d",
++            socket_options[i].name, value);
++      } else if (socket_options[i].opt_type == IVAS_ZMQ_TYPE_INT64) {
++        gint64 value;
++
++        if (!json_is_integer (jobj)) {
++          GST_WARNING_OBJECT (sink,
++              "socket option %s value is not integer type",
++              socket_options[i].name);
++          continue;
++        }
++        value = (gint64) json_integer_value (jobj);
++
++        iret = zmq_setsockopt (sink->priv->socket, socket_options[i].option,
++            &value, sizeof (value));
++        if (iret) {
++          GST_ERROR_OBJECT (sink,
++              "failed to set socket option %s with value %ld",
++              socket_options[i].name, value);
++          return FALSE;
++        }
++        GST_LOG_OBJECT (sink, "successfully set %s with value %ld",
++            socket_options[i].name, value);
++      } else if (socket_options[i].opt_type == IVAS_ZMQ_TYPE_REAL) {
++        double value;
++
++        if (!json_is_real (jobj)) {
++          GST_WARNING_OBJECT (sink, "socket option %s value is not real type",
++              socket_options[i].name);
++          continue;
++        }
++        value = json_real_value (jobj);
++
++        iret = zmq_setsockopt (sink->priv->socket, socket_options[i].option,
++            &value, sizeof (value));
++        if (iret) {
++          GST_ERROR_OBJECT (sink,
++              "failed to set socket option %s with value %f",
++              socket_options[i].name, value);
++          return FALSE;
++        }
++        GST_LOG_OBJECT (sink, "successfully set %s with value %f",
++            socket_options[i].name, value);
++      } else {
++        GST_ERROR_OBJECT (sink, "unsupported option value type");
++        return FALSE;
++      }
++    }
++  }
++
++  return TRUE;
++}
++
++static void
++gst_ivas_xzmq_sink_class_init (GstIvas_XZmqSinkClass * klass)
++{
++  GObjectClass *gobject_class;
++  GstElementClass *gstelement_class;
++  GstBaseSinkClass *gstbasesink_class;
++
++  gobject_class = (GObjectClass *) klass;
++  gstelement_class = (GstElementClass *) klass;
++  gstbasesink_class = (GstBaseSinkClass *) klass;
++
++  gobject_class->set_property =
++      GST_DEBUG_FUNCPTR (gst_ivas_xzmq_sink_set_property);
++  gobject_class->get_property =
++      GST_DEBUG_FUNCPTR (gst_ivas_xzmq_sink_get_property);
++  gobject_class->finalize = GST_DEBUG_FUNCPTR (gst_ivas_xzmq_sink_finalize);
++
++  gstbasesink_class->propose_allocation = GST_DEBUG_FUNCPTR (gst_ivas_xzmq_sink_propose_allocation);
++  gstbasesink_class->start = GST_DEBUG_FUNCPTR (gst_ivas_xzmq_sink_start);
++  gstbasesink_class->stop = GST_DEBUG_FUNCPTR (gst_ivas_xzmq_sink_stop);
++  gstbasesink_class->render = GST_DEBUG_FUNCPTR (gst_ivas_xzmq_sink_render);
++#ifdef SINK_EVENT_SUPPORTED
++  gstbasesink_class->event = GST_DEBUG_FUNCPTR (gst_ivas_xzmq_sink_event);
++#endif 
++
++  g_object_class_install_property (gobject_class, PROP_ENDPOINT,
++      g_param_spec_string ("endpoint", "ZMQ Endpoint",
++          "ZMQ end point to send out buffers (e.g. ipc:///tmp/test.ipc)",
++          NULL,
++          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
++          GST_PARAM_MUTABLE_READY));
++
++  g_object_class_install_property (gobject_class, PROP_PATTERN,
++      g_param_spec_enum ("pattern", "ZMQ Pattern type",
++          "ZMQ pattern to define socket type",
++          GST_IVAS_XZMQ_SINK_PATTERN,
++          IVAS_XZMQ_PATTERN_NONE,
++          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
++          GST_PARAM_MUTABLE_READY));
++
++  g_object_class_install_property (gobject_class, PROP_SEND_META,
++      g_param_spec_boolean ("send-meta", "Sends metadata",
++          "Sends events & buffers metadata as first part in multipart message",
++          TRUE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
++
++  g_object_class_install_property (gobject_class, PROP_IPC_ZEROCOPY,
++      g_param_spec_boolean ("ipc-zerocopy", "IPC Zero Copy Mode",
++          "Enable/Disable IPC zero copy mode",
++          FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
++
++  g_object_class_install_property (gobject_class, PROP_SOCKET_OPTIONS,
++      g_param_spec_string ("socket-options", "ZMQ Socket options",
++          "ZMQ socket options in JSON format string",
++          NULL, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
++
++  /* signal will be emitted in request-reply pattern for reply message */
++  gst_ivas_xzmq_sink_signals[SIGNAL_REPLY_MESSAGE] =
++      g_signal_new ("reply-message", G_TYPE_FROM_CLASS (klass),
++      G_SIGNAL_RUN_LAST, 0, NULL, NULL, g_cclosure_marshal_generic,
++      G_TYPE_NONE, 2, G_TYPE_POINTER, G_TYPE_UINT);
++
++  gst_element_class_add_pad_template (gstelement_class,
++      gst_static_pad_template_get (&sinktemplate));
++
++  gst_element_class_set_static_metadata (gstelement_class,
++      "IVAS ZeroMQ Sink", "Sink/Network",
++      "Send data on ZeroMQ socket", "Xilinx Inc <www.xilinx.com>");
++
++  GST_DEBUG_CATEGORY_INIT (ivas_xzmqsink_debug, "ivas_xzmqsink", 0,
++      "IVAS ZeroMQ Sink");
++}
++
++static void
++gst_ivas_xzmq_sink_init (GstIvas_XZmqSink * sink)
++{
++  GstIvas_XZmqSinkPrivate *priv = GST_IVAS_XZMQSINK_PRIVATE (sink);
++  sink->priv = priv;
++
++  sink->endpoint = NULL;
++  sink->pattern = IVAS_XZMQ_PATTERN_NONE;
++  sink->send_meta = TRUE;
++  sink->ipc_zerocopy = FALSE;
++  sink->socket_options = NULL;
++
++  priv->context = zmq_ctx_new ();
++  priv->last_zc_error = FALSE;
++  priv->zc_thread = NULL;
++}
++
++static void
++gst_ivas_xzmq_sink_finalize (GObject * obj)
++{
++  GstIvas_XZmqSink *sink = GST_IVAS_XZMQ_SINK (obj);
++
++  if (sink->endpoint)
++    g_free (sink->endpoint);
++
++  if (sink->socket_options)
++    g_free (sink->socket_options);
++
++  zmq_ctx_destroy (sink->priv->context);
++  G_OBJECT_CLASS (parent_class)->finalize (obj);
++}
++
++static void
++gst_ivas_xzmq_sink_set_property (GObject * object, guint prop_id,
++    const GValue * value, GParamSpec * pspec)
++{
++  GstIvas_XZmqSink *sink = GST_IVAS_XZMQ_SINK (object);
++
++  switch (prop_id) {
++    case PROP_ENDPOINT:
++      if (!g_value_get_string (value)) {
++        g_warning ("endpoint property cannot be NULL");
++        break;
++      }
++      if (sink->endpoint) {
++        g_free (sink->endpoint);
++      }
++      sink->endpoint = g_value_dup_string (value);
++      break;
++    case PROP_PATTERN:
++      sink->pattern = g_value_get_enum (value);
++      break;
++    case PROP_SEND_META:
++      sink->send_meta = g_value_get_boolean (value);
++      break;
++    case PROP_IPC_ZEROCOPY:
++      sink->ipc_zerocopy = g_value_get_boolean (value);
++      break;
++    case PROP_SOCKET_OPTIONS:
++      if (sink->socket_options) {
++        g_free (sink->socket_options);
++      }
++      sink->socket_options = g_value_dup_string (value);
++      break;
++    default:
++      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
++      break;
++  }
++}
++
++static void
++gst_ivas_xzmq_sink_get_property (GObject * object, guint prop_id,
++    GValue * value, GParamSpec * pspec)
++{
++  GstIvas_XZmqSink *sink = GST_IVAS_XZMQ_SINK (object);
++
++  switch (prop_id) {
++    case PROP_ENDPOINT:
++      g_value_set_string (value, sink->endpoint);
++      break;
++    case PROP_PATTERN:
++      g_value_set_enum (value, sink->pattern);
++      break;
++    case PROP_SEND_META:
++      g_value_set_boolean (value, sink->send_meta);
++      break;
++    case PROP_IPC_ZEROCOPY:
++      g_value_set_boolean (value, sink->ipc_zerocopy);
++      break;
++    case PROP_SOCKET_OPTIONS:
++      g_value_set_string (value, sink->socket_options);
++      break;
++    default:
++      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
++      break;
++  }
++}
++
++static gboolean gst_ivas_xzmq_sink_propose_allocation (GstBaseSink *sink, 
++    GstQuery * query)
++{
++  GstIvas_XZmqSink *self = GST_IVAS_XZMQ_SINK (sink);
++  GstCaps *caps;
++  GstVideoInfo info;
++  GstBufferPool *pool;
++  guint size;
++
++  gst_query_parse_allocation (query, &caps, NULL);
++
++  if (caps == NULL)
++    return FALSE;
++
++  if (!gst_video_info_from_caps (&info, caps))
++    return FALSE;
++
++  size = GST_VIDEO_INFO_SIZE (&info);
++
++  if (gst_query_get_n_allocation_pools (query) == 0) {
++    GstStructure *structure;
++    GstAllocator *allocator = NULL;
++    GstAllocationParams params = { GST_MEMORY_FLAG_PHYSICALLY_CONTIGUOUS, 0, 0,
++      0
++    };
++
++    if (gst_query_get_n_allocation_params (query) > 0) {
++      gst_query_parse_nth_allocation_param (query, 0, &allocator, &params);
++    } else {
++      allocator = gst_ivas_allocator_new (DEFAULT_DEVICE_INDEX, USE_DMABUF);
++      gst_query_add_allocation_param (query, allocator, &params);
++    }
++
++    pool = gst_video_buffer_pool_new ();
++    GST_LOG_OBJECT (self, "allocated internal sink pool %p", pool);
++
++    structure = gst_buffer_pool_get_config (pool);
++    gst_buffer_pool_config_set_params (structure, caps, size, MIN_POOL_BUFFERS, 0);
++    gst_buffer_pool_config_set_allocator (structure, allocator, &params);
++
++    gst_buffer_pool_config_add_option (structure,
++        GST_BUFFER_POOL_OPTION_VIDEO_META);
++
++    if (allocator)
++      gst_object_unref (allocator);
++
++    if (!gst_buffer_pool_set_config (pool, structure))
++      goto config_failed;
++
++    GST_OBJECT_LOCK (self);
++    gst_query_add_allocation_pool (query, pool, size, MIN_POOL_BUFFERS, 0);
++    GST_OBJECT_UNLOCK (self);
++
++    gst_query_add_allocation_meta (query, GST_VIDEO_META_API_TYPE, NULL);
++  }
++
++  return TRUE;
++
++  /* ERRORS */
++config_failed:
++  {
++    GST_ERROR_OBJECT (self, "failed to set config");
++    gst_object_unref (pool);
++    return FALSE;
++  }
++}
++
++#ifdef SINK_EVENT_SUPPORTED
++static gboolean
++gst_ivas_xzmq_sink_event (GstBaseSink * bsink, GstEvent * event)
++{
++  GstIvas_XZmqSink *sink = GST_IVAS_XZMQ_SINK (bsink);
++  gboolean bret = FALSE;
++
++  if (sink->send_meta) {
++    bret = ivas_xzmq_sink_send_meta_event (sink, event);
++    if (!bret)
++      return FALSE;
++  }
++  return GST_BASE_SINK_CLASS (parent_class)->event (bsink, event);
++}
++#endif //SINK_EVENT_SUPPORTED
++
++#ifdef DUMP_JSON_YDATA
++char JsonPath[64] = "";
++FILE *JsonFp;
++char DataPath[64] = "";
++FILE *DataFp;
++#endif //DUMP_JSON_YDATA
++
++/* metadata
++ *
++ * buffer or event flag to indicate
++ *
++ * if buffer :
++ *    GstClockTime           pts;
++ *    GstClockTime           dts;
++ *    GstClockTime           duration;
++ *    guint64                offset;
++ *    guint64                offset_end;
++ *
++ *    below valid in IPC transport only:
++ *      - dmafd
++ *      - XRT BO
++ *
++ *    IVAS ridgerun meta string
++ *
++ *    flags about the buffer like key frame or something
++ *
++ * if event :
++ *    Sending Event string using gst_event_type_to_quark
++ */
++#ifndef ZERO_COPY_SUPPORTED
++static gboolean
++ivas_xzmq_sink_send_meta_buffer (GstIvas_XZmqSink * sink, GstBuffer * buffer, gboolean * detection_found)
++{
++  gchar *infer_metadata = NULL;
++  zmq_msg_t msg;
++  int iret;
++  gchar *json_meta = NULL, *meta_data = NULL;
++  GstVideoMeta *vmeta = NULL;
++  guint width = 0, height = 0;
++  GstInferenceMeta *infer_meta = NULL;
++  GstInferencePrediction *root, *child;
++  GSList *child_predictions;
++  GstInferenceClassification *classification;
++  struct timeval  tv;
++  double epoch_time;
++
++  GST_LOG_OBJECT (sink, "preparing buffer %p metadata", buffer);
++  
++  vmeta = gst_buffer_get_video_meta (buffer);
++  if (vmeta == NULL) {
++    printf("video meta not present in Gst buffer\n");
++  }
++  else {
++    width = vmeta->stride[0];
++    height = vmeta->height;
++  }
++  sink->priv->framecount++;
++  sink->priv->y_data_sz = width * height;
++  
++#ifdef DUMP_JSON_YDATA
++  sprintf(JsonPath,"/tmp/%d.json", sink->priv->framecount);
++  printf("%s\n", JsonPath);
++  JsonFp = fopen(JsonPath, "wb");
++#endif //DUMP_JSON_YDATA
++  
++  infer_meta = ((GstInferenceMeta *) gst_buffer_get_meta ((GstBuffer *)
++          buffer, gst_inference_meta_api_get_type ()));
++
++  gettimeofday(&tv, NULL);
++  epoch_time = ((double)tv.tv_sec + ((double)tv.tv_usec/1000000)) ;
++  
++  meta_data = g_strdup_printf ("{\"imageWidth\":%u,"
++      "\"imageHeight\":%u,"
++      "\"channels\":%u,"
++      "\"modelName\":\"veh_lp\","
++      "\"frameCount\":%lu,"
++      "\"timeStamp\":%f,"
++      "\"classes\":[\"motorcycle\",\"auto\",\"car\",\"jeep\",\"mini-truck\",\"tempo-traveller\",\"bus\",\"truck\",\"Number-plate\"]"
++      ,
++      width, height, 1, sink->priv->framecount,
++      epoch_time);
++
++  json_meta = g_strconcat (meta_data, NULL);
++  g_free(meta_data);
++  meta_data = json_meta;
++  
++  if (infer_meta) {
++    gchar *detection_metadata = NULL;
++    gchar *detection_metadata_list = NULL;
++    gint bbox_x_pos;
++    guint bbox_width;
++    
++    root = infer_meta->prediction;
++    *detection_found = TRUE;
++
++    /* Iterate through the immediate child predictions */
++    for (child_predictions = gst_inference_prediction_get_children (root);
++        child_predictions;
++        child_predictions = g_slist_next (child_predictions)) {
++      child = (GstInferencePrediction *) child_predictions->data;
++      classification = (GstInferenceClassification *) child->classifications->data;
++
++      bbox_x_pos = child->bbox.x;
++      bbox_width = child->bbox.width;
++#ifdef ADD_XOFFSET_TO_LP
++      if (classification->class_id == ALPR_CLASS_ID_LP) {
++        bbox_x_pos -= (vmeta->width/(100/LP_XOFFSET_PERCENT));
++        if (bbox_x_pos <= 1)
++          bbox_x_pos = 1;
++        
++        bbox_width += (vmeta->width/(50/LP_XOFFSET_PERCENT));
++        if ((bbox_x_pos + bbox_width) >= vmeta->width)
++          bbox_width = vmeta->width - bbox_x_pos;
++      }
++#endif //ADD_XOFFSET_TO_LP
++      
++      infer_metadata = g_strdup_printf (
++          "{"
++          "\"xstart\":%u,"
++          "\"ystart\":%u,"
++          "\"width\":%u,"
++          "\"height\":%u,"
++          "\"class\":%d,"
++          "\"confidence\":%u"
++          "}",
++          bbox_x_pos, child->bbox.y,
++          bbox_width, child->bbox.height,
++          classification->class_id,
++          (guint)(classification->class_prob * 100));
++      
++      if (detection_metadata_list) {
++        detection_metadata = g_strconcat (detection_metadata_list, infer_metadata, NULL);
++        g_free(detection_metadata_list);
++      } else {
++        detection_metadata = g_strconcat (infer_metadata, NULL);
++      }
++      
++      if (g_slist_next (child_predictions)) {
++        detection_metadata_list = g_strconcat (detection_metadata, ",", NULL);
++        g_free (detection_metadata);
++      } else {
++        detection_metadata_list = detection_metadata;
++      }
++      
++      g_free (infer_metadata);
++    }
++    
++    if (detection_metadata_list) {
++      meta_data = g_strconcat (json_meta, ",", "\"detections\":[", detection_metadata_list, "]", NULL);
++      g_free(json_meta);
++      g_free(detection_metadata_list);
++    }
++    else
++      *detection_found = FALSE;
++  } else {
++    *detection_found = FALSE;
++  }
++
++  json_meta = g_strconcat (meta_data, "}", NULL);
++  g_free(meta_data);
++  if (!json_meta) {
++    GST_ERROR_OBJECT (sink, "failed to allocate memory");
++    goto error;
++  }
++  
++#ifdef DUMP_JSON_YDATA
++  if(JsonFp) {
++    fwrite(json_meta, strlen(json_meta), 1, JsonFp);
++    fclose(JsonFp);
++  }
++#endif //DUMP_JSON_YDATA
++
++  GST_LOG_OBJECT (sink, "preapred buffer meta string %s", json_meta); 
++
++  if (*detection_found == TRUE) {
++    iret = zmq_msg_init_data (&msg, json_meta, strlen (json_meta),
++        ivas_xzmq_sink_metadata_free_cb, NULL);
++    if (iret) {
++      GST_ERROR_OBJECT (sink, "failed to create metadata message");
++      goto error;
++    }
++
++    /* send meta buffer message */
++    iret = zmq_msg_send (&msg, sink->priv->socket,
++        sink->priv->has_zerocopy ? 0 : ZMQ_SNDMORE);
++    if (iret < 0) {
++      GST_ERROR_OBJECT (sink, "failed to send meta buffer");
++      goto error;
++    }
++
++    GST_DEBUG_OBJECT (sink, "successfully sent meta buffer");
++  } else {
++    g_free (json_meta);
++  }
++
++  return TRUE;
++
++error:
++  if (json_meta)
++    g_free (json_meta);
++  
++  return FALSE;
++}
++#else
++static gboolean
++ivas_xzmq_sink_send_meta_buffer (GstIvas_XZmqSink * sink, GstBuffer * buffer)
++{
++  gchar *metadata = NULL;
++  zmq_msg_t msg;
++  int iret;
++  GstMemory *mem = NULL;
++  gchar *extra_meta = NULL;
++  gchar *json_meta = NULL;
++
++  GST_LOG_OBJECT (sink, "preparing buffer %p metadata", buffer);
++
++  mem = gst_buffer_get_memory (buffer, 0);
++  if (!mem) {
++    GST_ERROR_OBJECT (sink, "failed to get memory");
++    goto error;
++  }
++
++  metadata = g_strdup_printf ("{\"meta-type\":\"buffer\","
++      "\"dts\":%ld,"
++      "\"pts\":%ld,"
++      "\"duration\":%ld,"
++      "\"size\":%lu",
++      (gint64) GST_BUFFER_DTS (buffer),
++      (gint64) GST_BUFFER_PTS (buffer), (gint64) GST_BUFFER_DURATION (buffer),
++      gst_buffer_get_size (buffer));
++
++  if (sink->ipc_zerocopy && g_str_has_prefix (sink->endpoint, "ipc")) {
++    gboolean bret = FALSE;
++
++    if (G_UNLIKELY (!sink->priv->zc_bufs)) {
++      sink->priv->zc_bufs =
++          g_hash_table_new_full (g_direct_hash, g_direct_equal, NULL,
++          (void (*)(void *)) gst_buffer_unref);
++    }
++
++    if (gst_is_dmabuf_memory (mem)) {
++      gint dma_fd = -1;
++
++      dma_fd = gst_dmabuf_memory_get_fd (mem);
++      extra_meta = g_strdup_printf (", \"dma-fd\":%d", dma_fd);
++      sink->priv->has_zerocopy = TRUE;
++
++      bret =
++          g_hash_table_insert (sink->priv->zc_bufs, GINT_TO_POINTER (dma_fd),
++          buffer);
++      if (!bret) {
++        GST_ERROR_OBJECT (sink, "failed to insert key %d", dma_fd);
++        goto error;
++      }
++
++      GST_LOG_OBJECT (sink, "associating key %d with value %p", dma_fd, buffer);
++    } else if (gst_is_ivas_memory (mem)) {
++      gint dma_fd = -1;
++      guint dev_idx;
++
++      dma_fd = gst_ivas_allocator_get_dmafd (mem);
++      dev_idx = gst_ivas_allocator_get_device_idx (mem->allocator);
++
++      extra_meta =
++          g_strdup_printf
++          (", \"dma-fd\":%d, \"is-xrt-memory\":true, \"dev-idx\":%u", dma_fd,
++          dev_idx);
++      sink->priv->has_zerocopy = TRUE;
++
++      bret =
++          g_hash_table_insert (sink->priv->zc_bufs, GINT_TO_POINTER (dma_fd),
++          buffer);
++      if (!bret) {
++        GST_ERROR_OBJECT (sink, "failed to insert key %d", dma_fd);
++        goto error;
++      }
++      GST_LOG_OBJECT (sink, "associating key %d with value %p", dma_fd, buffer);
++
++    } else {
++      GST_DEBUG_OBJECT (sink,
++          "zero copy not possible as buffer is neither DMA nor XRT");
++      sink->priv->has_zerocopy = FALSE;
++    }
++
++    if (G_UNLIKELY (!sink->priv->zc_thread) && sink->priv->has_zerocopy) {
++      gchar *tname = NULL;
++
++      tname = g_strdup_printf ("ipc-zc-thread-%s", GST_ELEMENT_NAME (sink));
++
++      GST_INFO_OBJECT (sink, "create zero copy thread %s", tname);
++
++      /* thread to listen for freed buffers by peer */
++      sink->priv->zc_thread = g_thread_new
++          (tname, ivas_xzmq_sink_zerocopy_thread, sink);
++      g_free (tname);
++    }
++  }
++
++  if (extra_meta) {
++    json_meta = g_strconcat (metadata, extra_meta, "}", NULL);
++    g_free (extra_meta);
++  } else {
++    json_meta = g_strconcat (metadata, "}", NULL);
++  }
++
++  g_free (metadata);
++
++  if (!json_meta) {
++    GST_ERROR_OBJECT (sink, "failed to allocate memory");
++    goto error;
++  }
++
++  GST_LOG_OBJECT (sink, "preapred buffer meta string %s", json_meta);
++
++  iret = zmq_msg_init_data (&msg, json_meta, strlen (json_meta),
++      ivas_xzmq_sink_metadata_free_cb, NULL);
++  if (iret) {
++    GST_ERROR_OBJECT (sink, "failed to create metadata message");
++    goto error;
++  }
++
++  /* send meta buffer message */
++  iret = zmq_msg_send (&msg, sink->priv->socket,
++      sink->priv->has_zerocopy ? 0 : ZMQ_SNDMORE);
++  if (iret < 0) {
++    GST_ERROR_OBJECT (sink, "failed to send meta event");
++    goto error;
++  }
++
++  gst_memory_unref (mem);
++
++  GST_DEBUG_OBJECT (sink, "successfully sent meta buffer");
++
++  return TRUE;
++
++error:
++  if (mem)
++    gst_memory_unref (mem);
++
++  return FALSE;
++}
++#endif //ZERO_COPY_SUPPORTED
++
++#ifdef SINK_EVENT_SUPPORTED
++static gboolean
++ivas_xzmq_sink_send_meta_event (GstIvas_XZmqSink * sink, GstEvent * event)
++{
++  gchar *equark = NULL;
++  gchar *estr = NULL;
++  gchar *mod_estr = NULL;
++  gchar *metadata = NULL;
++  int iret;
++  zmq_msg_t msg;
++  const GstStructure *structure;
++
++  equark = (gchar *) gst_event_type_get_name (GST_EVENT_TYPE (event));
++
++  GST_DEBUG_OBJECT (sink, "preparing event %s metadata", equark);
++
++  structure = gst_event_get_structure (event);
++  if (structure) {
++    estr = gst_structure_to_string (structure);
++    if (!estr) {
++      GST_ERROR_OBJECT (sink, "failed to create string from structure");
++      goto error;
++    }
++
++    mod_estr = g_strescape (estr, NULL);
++    g_free (estr);
++  }
++  metadata =
++      g_strdup_printf
++      ("{\n\"meta-type\":\"event\",\n\"event-type\":\"%s\",\n\"event-structure\":\"%s\"\n}",
++      equark, mod_estr);
++
++  GST_LOG_OBJECT (sink, "json event string %s", metadata);
++
++  if (mod_estr)
++    g_free (mod_estr);
++
++  iret = zmq_msg_init_data (&msg, metadata, strlen (metadata),
++      ivas_xzmq_sink_metadata_free_cb, NULL);
++  if (iret) {
++    GST_ERROR_OBJECT (sink, "failed to create metadata message");
++    goto error;
++  }
++
++  /* send meta event message */
++  iret = zmq_msg_send (&msg, sink->priv->socket, 0);
++  if (iret < 0) {
++    GST_ERROR_OBJECT (sink, "failed to send meta event");
++    goto error;
++  }
++
++  if (sink->pattern == IVAS_XZMQ_PATTERN_REQREP) {
++    zmq_msg_t reply_msg;
++
++    iret = zmq_msg_init (&reply_msg);
++    if (iret) {
++      GST_ERROR_OBJECT (sink, "failed to initialize zmq message");
++      goto error;
++    }
++
++    /* receive reply message */
++    iret = zmq_msg_recv (&reply_msg, sink->priv->socket, 0);
++    if (iret < 0) {
++      GST_ERROR_OBJECT (sink, "failed to receive message. reason %d [%s]",
++          errno, zmq_strerror (errno));
++      goto error;
++    }
++
++    GST_DEBUG_OBJECT (sink, "received reply message of size %lu",
++        zmq_msg_size (&reply_msg));
++
++    g_signal_emit (sink, gst_ivas_xzmq_sink_signals[SIGNAL_REPLY_MESSAGE], 0,
++        zmq_msg_data (&reply_msg), zmq_msg_size (&reply_msg));
++
++    zmq_msg_close (&reply_msg);
++  }
++
++  GST_DEBUG_OBJECT (sink, "successfully sent meta event");
++
++  return TRUE;
++
++error:
++  if (metadata)
++    g_free (metadata);
++
++  return FALSE;
++}
++#endif //SINK_EVENT_SUPPORTED
++
++static GstFlowReturn
++gst_ivas_xzmq_sink_render (GstBaseSink * basesink, GstBuffer * buffer)
++{
++  GstIvas_XZmqSink *sink = GST_IVAS_XZMQ_SINK (basesink);
++  zmq_msg_t msg;
++  int iret;
++  gboolean bret = FALSE;
++  Ivas_XZmqDataCbObj *cb_data = NULL;
++  gboolean detection_found;
++
++  if (sink->priv->last_zc_error) {
++    GST_ERROR_OBJECT (sink, "error occured in zero copy");
++    return GST_FLOW_ERROR;
++  }
++
++  if (sink->send_meta) {
++    bret = ivas_xzmq_sink_send_meta_buffer (sink, buffer, &detection_found);
++    if (!bret)
++      goto error;
++    
++    if (detection_found == FALSE) {
++      return GST_FLOW_OK;
++    }
++  }
++
++  if (sink->priv->has_zerocopy) {
++    GST_LOG_OBJECT (sink, "zero copy enabled.. not sending actual data");
++
++    if (sink->pattern == IVAS_XZMQ_PATTERN_REQREP) {
++      zmq_msg_t reply_msg;
++
++      iret = zmq_msg_init (&reply_msg);
++      if (iret) {
++        GST_ERROR_OBJECT (sink, "failed to initialize zmq message");
++        goto error;
++      }
++
++      /* receive reply message */
++      iret = zmq_msg_recv (&reply_msg, sink->priv->socket, 0);
++      if (iret < 0) {
++        GST_ERROR_OBJECT (sink, "failed to receive message. reason %d [%s]",
++            errno, zmq_strerror (errno));
++        goto error;
++      }
++
++      GST_DEBUG_OBJECT (sink, "received reply message of size %lu",
++          zmq_msg_size (&reply_msg));
++
++      g_signal_emit (sink, gst_ivas_xzmq_sink_signals[SIGNAL_REPLY_MESSAGE], 0,
++          zmq_msg_data (&reply_msg), zmq_msg_size (&reply_msg));
++
++      zmq_msg_close (&reply_msg);
++    }
++
++    /* corresponding unref for below reference will be
++     * called in zerocopy thread */
++    gst_buffer_ref (buffer);
++    return GST_FLOW_OK;
++  }
++
++  cb_data = g_slice_new0 (Ivas_XZmqDataCbObj);
++  /* holding reference to avoid unref by gstbasesink
++   * this extra reference will be decremented by zmq_msg_init_data free callback
++   */
++  cb_data->buffer = gst_buffer_ref (buffer);
++
++  bret = gst_buffer_map (buffer, &(cb_data->map_info), GST_MAP_READ);
++  if (!bret) {
++    GST_ERROR_OBJECT (sink, "failed to map buffer");
++    goto error;
++  }
++  
++#ifdef DUMP_JSON_YDATA
++  sprintf(DataPath,"/tmp/%d.y", sink->priv->framecount);
++  printf("%s\n", DataPath);
++  DataFp = fopen(DataPath, "wb");
++  
++  if(DataFp) {
++    fwrite(cb_data->map_info.data, sink->priv->y_data_sz, 1, DataFp);
++    fclose(DataFp);
++  }
++#endif //DUMP_JSON_YDATA
++
++  iret =
++      zmq_msg_init_data (&msg, cb_data->map_info.data, sink->priv->y_data_sz, /*cb_data->map_info.size,*/
++      ivas_xzmq_sink_data_free_cb, cb_data);
++  if (iret) {
++    GST_ERROR_OBJECT (sink, "failed to create buffer message");
++    goto error;
++  }
++
++  /* send buffer message */
++  iret = zmq_msg_send (&msg, sink->priv->socket, 0);
++  if (iret < 0) {
++    GST_ERROR_OBJECT (sink, "failed to send buffer message");
++    goto error;
++  }
++
++  if (sink->pattern == IVAS_XZMQ_PATTERN_REQREP) {
++    zmq_msg_t reply_msg;
++
++    iret = zmq_msg_init (&reply_msg);
++    if (iret) {
++      GST_ERROR_OBJECT (sink, "failed to initialize zmq message");
++      goto error;
++    }
++
++    /* receive reply message */
++    iret = zmq_msg_recv (&reply_msg, sink->priv->socket, 0);
++    if (iret < 0) {
++      GST_ERROR_OBJECT (sink, "failed to receive message. reason %d [%s]",
++          errno, zmq_strerror (errno));
++      goto error;
++    }
++
++    GST_DEBUG_OBJECT (sink, "received reply message of size %lu",
++        zmq_msg_size (&reply_msg));
++
++    g_signal_emit (sink, gst_ivas_xzmq_sink_signals[SIGNAL_REPLY_MESSAGE], 0,
++        zmq_msg_data (&reply_msg), zmq_msg_size (&reply_msg));
++
++    zmq_msg_close (&reply_msg);
++  }
++
++  GST_DEBUG_OBJECT (sink, "successfully sent data of size %" G_GSIZE_FORMAT,
++      gst_buffer_get_size (buffer));
++
++  return GST_FLOW_OK;
++
++error:
++  return GST_FLOW_ERROR;
++}
++
++static gboolean
++gst_ivas_xzmq_sink_start (GstBaseSink * basesink)
++{
++  GstIvas_XZmqSink *sink = GST_IVAS_XZMQ_SINK (basesink);
++  int type, iret;
++  gboolean is_server = TRUE;
++  gboolean bret = FALSE;
++
++  GST_DEBUG_OBJECT (sink, "starting");
++
++  switch (sink->pattern) {
++    case IVAS_XZMQ_PATTERN_PIPELINE:
++      type = ZMQ_PUSH;
++      break;
++    case IVAS_XZMQ_PATTERN_PUBSUB:
++      type = ZMQ_PUB;
++      break;
++    case IVAS_XZMQ_PATTERN_REQREP:
++      type = ZMQ_REQ;
++      /* in req-rep pattern, sink plugins sends data and wait for reply */
++      is_server = FALSE;
++      break;
++    default:
++      GST_ERROR_OBJECT (sink, "select valid pattern");
++      return FALSE;
++  }
++
++  /* create socket based on chosen pattern */
++  sink->priv->socket = zmq_socket (sink->priv->context, type);
++  if (!sink->priv->socket) {
++    GST_ERROR_OBJECT (sink, "failed to create socket");
++    GST_ELEMENT_ERROR (sink, RESOURCE, OPEN_READ_WRITE,
++        ("zmq_socket() failed with error code %d [%s]", errno,
++            zmq_strerror (errno)), NULL);
++    return FALSE;
++  }
++
++  if (sink->socket_options) {
++    bret = ivas_xzmq_sink_set_socket_options (sink);
++    if (!bret) {
++      GST_ERROR_OBJECT (sink, "failed to set socket options");
++      return FALSE;
++    }
++  }
++  if (is_server) {
++    guint sndhwm = SEND_DATA_HIGH_WM;
++
++    iret =
++        zmq_setsockopt (sink->priv->socket, ZMQ_SNDHWM, &sndhwm,
++        sizeof (sndhwm));
++    if (iret) {
++      GST_ERROR_OBJECT (sink, "failed to set high watermark on send");
++      return FALSE;
++    }
++
++    GST_DEBUG_OBJECT (sink, "binding to endpoint %s", sink->endpoint);
++
++    iret = zmq_bind (sink->priv->socket, sink->endpoint);
++    if (iret) {
++      GST_ERROR_OBJECT (sink, "failed to bind on endpoint %s", sink->endpoint);
++      GST_ELEMENT_ERROR (sink, RESOURCE, OPEN_READ_WRITE,
++          ("zmq_bind() to endpoint \"%s\" failed with error code %d [%s]",
++              sink->endpoint, errno, zmq_strerror (errno)), NULL);
++      return FALSE;
++    }
++
++    GST_INFO_OBJECT (sink, "bind completed to end point %s", sink->endpoint);
++  } else {
++    guint rcvhwm = RECV_DATA_HIGH_WM;
++
++    iret =
++        zmq_setsockopt (sink->priv->socket, ZMQ_RCVHWM, &rcvhwm,
++        sizeof (rcvhwm));
++    if (iret) {
++      GST_ERROR_OBJECT (sink, "failed to set high watermark on receive");
++      return FALSE;
++    }
++
++    GST_DEBUG_OBJECT (sink, "connecting to endpoint %s", sink->endpoint);
++
++    iret = zmq_connect (sink->priv->socket, sink->endpoint);
++    if (iret) {
++      GST_ELEMENT_ERROR (sink, RESOURCE, OPEN_READ_WRITE,
++          ("zmq_connect() to endpoint \"%s\" failed with error code %d [%s]",
++              sink->endpoint, errno, zmq_strerror (errno)), NULL);
++      return FALSE;
++    }
++  }
++
++  sink->priv->framecount = 0;
++  return TRUE;
++}
++
++static gboolean
++gst_ivas_xzmq_sink_stop (GstBaseSink * basesink)
++{
++  GstIvas_XZmqSink *sink = GST_IVAS_XZMQ_SINK (basesink);
++  int iret;
++  gboolean is_server = TRUE;
++
++  GST_DEBUG_OBJECT (sink, "stopping");
++
++  if (sink->pattern == IVAS_XZMQ_PATTERN_REQREP) {
++    is_server = FALSE;
++  }
++
++  if (is_server) {
++    GST_DEBUG_OBJECT (sink, "unbinding to endpoint %s", sink->endpoint);
++
++    iret = zmq_unbind (sink->priv->socket, sink->endpoint);
++    if (iret) {
++      GST_ERROR_OBJECT (sink, "failed to unbind on endpoint %s",
++          sink->endpoint);
++      GST_ELEMENT_ERROR (sink, RESOURCE, OPEN_READ_WRITE,
++          ("zmq_unbind() to endpoint \"%s\" failed with error code %d [%s]",
++              sink->endpoint, errno, zmq_strerror (errno)), NULL);
++      return FALSE;
++    }
++
++    GST_INFO_OBJECT (sink, "unbind completed to end point %s", sink->endpoint);
++  } else {
++    GST_DEBUG_OBJECT (sink, "disconnecting to endpoint %s", sink->endpoint);
++
++    iret = zmq_disconnect (sink->priv->socket, sink->endpoint);
++    if (iret) {
++      GST_ELEMENT_ERROR (sink, RESOURCE, OPEN_READ_WRITE,
++          ("zmq_disconnect() to endpoint \"%s\" failed with error code %d [%s]",
++              sink->endpoint, errno, zmq_strerror (errno)), NULL);
++      return FALSE;
++    }
++
++    GST_INFO_OBJECT (sink, "disconnected completed to end point %s",
++        sink->endpoint);
++  }
++
++  /* messages in queues will be sent even after socket close
++   * as default LINGER time is -1 i.e. infinite */
++  iret = zmq_close (sink->priv->socket);
++  if (iret) {
++    GST_WARNING_OBJECT (sink, "zmq_close() failed with error code %d [%s]",
++        errno, strerror (errno));
++    return FALSE;
++  }
++  
++  sink->priv->framecount = 0;
++  return TRUE;
++}
++
++static gboolean
++ivas_xzmq_sink_init (GstPlugin * ivas_xzmqsink)
++{
++  return gst_element_register (ivas_xzmqsink, "ivas_xzmqsink",
++      GST_RANK_NONE, GST_TYPE_IVAS_XZMQ_SINK);
++}
++
++/* PACKAGE: this is usually set by autotools depending on some _INIT macro
++ * in configure.ac and then written into and defined in config.h, but we can
++ * just set it ourselves here in case someone doesn't use autotools to
++ * compile this code. GST_PLUGIN_DEFINE needs PACKAGE to be defined.
++ */
++#ifndef PACKAGE
++#define PACKAGE "ivas_xzmqsink"
++#endif
++
++GST_PLUGIN_DEFINE (GST_VERSION_MAJOR,
++    GST_VERSION_MINOR,
++    ivas_xzmqsink,
++    "Xilinx IVAS ZMQ Sink",
++    ivas_xzmq_sink_init, "1.0", "Proprietary",
++    "Xilinx IVAS SDK plugin", "http://xilinx.com/")
+diff --git a/ext/zmqsink/gstivas_xzmqsink.h b/ext/zmqsink/gstivas_xzmqsink.h
+new file mode 100644
+index 0000000..cfbc62d
+--- /dev/null
++++ b/ext/zmqsink/gstivas_xzmqsink.h
+@@ -0,0 +1,76 @@
++/*
++* Copyright (C) 2020 - 2021 Xilinx, Inc.  All rights reserved.
++*
++* Permission is hereby granted, free of charge, to any person obtaining a
++* copy of this software and associated documentation files (the "Software"),
++* to deal in the Software without restriction, including without limitation the
++* rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
++* sell copies of the Software, and to permit persons to whom the Software
++* is furnished to do so, subject to the following conditions:
++* The above copyright notice and this permission notice shall be included in
++* all copies or substantial portions of the Software.
++*
++* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
++* KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++* MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
++* EVENT SHALL XILINX BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
++* WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT
++* OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++* SOFTWARE. Except as contained in this notice, the name of the Xilinx shall
++* not be used in advertising or otherwise to promote the sale, use or other
++* dealings in this Software without prior written authorization from Xilinx.
++*/
++
++#ifndef __GST_IVAS_XIVAS_XZMQ_SINK_H__
++#define __GST_IVAS_XIVAS_XZMQ_SINK_H__
++
++#include <gst/gst.h>
++#include <gst/base/gstbasesink.h>
++
++G_BEGIN_DECLS
++
++#define GST_TYPE_IVAS_XZMQ_SINK \
++  (gst_ivas_xzmq_sink_get_type())
++#define GST_IVAS_XZMQ_SINK(obj) \
++  (G_TYPE_CHECK_INSTANCE_CAST((obj),GST_TYPE_IVAS_XZMQ_SINK,GstIvas_XZmqSink))
++#define GST_IVAS_XZMQ_SINK_CLASS(klass) \
++  (G_TYPE_CHECK_CLASS_CAST((klass),GST_TYPE_IVAS_XZMQ_SINK,GstIvas_XZmqSinkClass))
++#define GST_IS_IVAS_XZMQ_SINK(obj) \
++  (G_TYPE_CHECK_INSTANCE_TYPE((obj),GST_TYPE_IVAS_XZMQ_SINK))
++#define GST_IS_IVAS_XZMQ_SINK_CLASS(klass) \
++  (G_TYPE_CHECK_CLASS_TYPE((klass),GST_TYPE_IVAS_XZMQ_SINK))
++
++typedef struct _GstIvas_XZmqSink GstIvas_XZmqSink;
++typedef struct _GstIvas_XZmqSinkClass GstIvas_XZmqSinkClass;
++typedef struct _GstIvas_XZmqSinkPrivate GstIvas_XZmqSinkPrivate;
++
++typedef enum
++{
++  IVAS_XZMQ_PATTERN_NONE,
++  IVAS_XZMQ_PATTERN_PIPELINE,
++  IVAS_XZMQ_PATTERN_PUBSUB,
++  IVAS_XZMQ_PATTERN_REQREP,
++} GstIvasXZmqPatternType;
++
++struct _GstIvas_XZmqSink {
++  GstBaseSink parent;
++
++  GstIvas_XZmqSinkPrivate *priv;
++
++  // properties
++  gchar *endpoint;
++  GstIvasXZmqPatternType pattern;
++  gboolean send_meta;
++  gboolean ipc_zerocopy;
++  gchar *socket_options;
++};
++
++struct _GstIvas_XZmqSinkClass {
++  GstBaseSinkClass parent_class;
++};
++
++GType gst_ivas_xzmq_sink_get_type (void);
++
++G_END_DECLS
++
++#endif /* __GST_IVAS_XIVAS_XZMQ_SINK_H__ */
+diff --git a/ext/zmqsink/meson.build b/ext/zmqsink/meson.build
+new file mode 100644
+index 0000000..1dc1ef8
+--- /dev/null
++++ b/ext/zmqsink/meson.build
+@@ -0,0 +1,18 @@
++zmqsink_source = [
++  'gstivas_xzmqsink.c',
++]
++
++zmqlib = dependency ('libzmq', version : '>=4.2', required : get_option('zmqsink'))
++
++if zmqlib.found()
++  gstivas_xzmqsink = library ('gstivas_xzmqsink',
++    zmqsink_source,
++    c_args : gst_plugins_ivas_args,
++    include_directories : [configinc, libsinc],
++    dependencies : [gst_dep, gstbase_dep, gstvideo_dep, zmqlib, jansson_dep, gstivasalloc_dep, gstallocators_dep, gstivasinfermeta_dep],
++    install : true,
++    install_dir : plugins_install_dir,
++  )
++pkgconfig.generate(gstivas_xzmqsink, install_dir : plugins_pkgconfig_install_dir)
++plugins += gstivas_xzmqsink
++endif
+diff --git a/meson.build b/meson.build
+index 62ad298..818702b 100644
+--- a/meson.build
++++ b/meson.build
+@@ -144,6 +144,7 @@ pkgconfig = import('pkgconfig')
+ subdir('gst-libs')
+ subdir('gst')
+ subdir('sys')
++subdir('ext')
+ 
+ configure_file(output : 'config.h', configuration : cdata)
+ 
+diff --git a/meson_options.txt b/meson_options.txt
+index 7f495c5..350e580 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -4,6 +4,7 @@ option('roigen', type : 'feature', value : 'auto')
+ option('filter', type : 'feature', value : 'auto')
+ option('multisrc', type : 'feature', value : 'auto')
+ option('abrscaler', type : 'feature', value : 'auto')
++option('zmqsink', type : 'feature', value : 'auto')
+ 
+ # Common feature options
+ option('examples', type : 'feature', value : 'auto', yield : true)
+-- 
+2.7.4
+
